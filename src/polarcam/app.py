@@ -1,6 +1,6 @@
 # ------------------------------------------
 # File: src/polarcam/app.py
-# (Minimal + ROI — four buttons + Mono12 preview + ROI dock, non‑disruptive refresh, no refresh button)
+# (Minimal + ROI v2 — four buttons + Mono12 preview + ROI dock; non‑disruptive refresh; no refresh button)
 # ------------------------------------------
 
 import sys
@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QDockWidget, QFormLayout, QLineEdit, QHBoxLayout
 )
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QMetaObject
 
 from .ids_backend import IDSCamera
 
@@ -18,7 +18,7 @@ from .ids_backend import IDSCamera
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("PolarCam — Minimal + ROI")
+        self.setWindowTitle("PolarCam — Minimal + ROI v2")
         self.resize(1200, 720)
 
         self.status = QStatusBar(); self.setStatusBar(self.status)
@@ -99,10 +99,6 @@ class MainWindow(QMainWindow):
         self.cam.set_roi(w, h, x, y)
 
     def _full_roi(self):
-        # Set offsets to 0 and make width/height large; worker snaps to limits
-        self.cam.set_roi(1e9, 1e9, 0.0, 0.0)
-
-    # signal handlers(self):
         # Set offsets to 0 and make width/height large; worker snaps to limits
         self.cam.set_roi(1e9, 1e9, 0.0, 0.0)
 

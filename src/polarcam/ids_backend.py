@@ -1,13 +1,13 @@
 # ------------------------------------------
 # File: src/polarcam/ids_backend.py
-# (Minimal + ROI — Open/Start/Stop/Close + Mono12 preview + Apply/Refresh ROI)
+# (Minimal + ROI v2 — non‑blocking ROI via mailbox processed inside grab loop)
 # ------------------------------------------
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from threading import Event
-from typing import List, Optional, Tuple, Dict, Union
+from threading import Event, Lock
+from typing import List, Optional, Tuple, Dict, Union, Any
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot, QMetaObject, Qt
 
@@ -46,6 +46,9 @@ class _StreamWorker(QObject):
         self._announced: List[object] = []
         self._run = Event()
         self._closed = False
+        # ROI mailbox (thread‑safe)
+        self._roi_lock = Lock()
+        self._pending_roi: Optional[Dict[str, Any]] = None
 
     # ---------- helpers ----------
     def _img_dims(self, img) -> Tuple[int,int]:
@@ -124,7 +127,6 @@ class _StreamWorker(QObject):
                 return float(getattr(n, attr)())
             except Exception:
                 pass
-        # enum fallbacks not needed for ROI
         return None
 
     def _node_min(self, name: str) -> Optional[float]:
@@ -174,6 +176,95 @@ class _StreamWorker(QObject):
             value = base + steps * inc
         return float(value)
 
+    def _pop_pending_roi(self) -> Optional[Dict[str, Any]]:
+        with self._roi_lock:
+            d = self._pending_roi
+            self._pending_roi = None
+            return d
+
+    def _apply_roi_payload(self, d: Dict[str, Any], while_running: bool) -> None:
+        try:
+            print(f"[Worker] apply_roi(payload) while_running={while_running}: {d}")
+            width = float(d.get("Width")); height = float(d.get("Height"))
+            offx = float(d.get("OffsetX")); offy = float(d.get("OffsetY"))
+        except Exception as e:
+            self.error.emit(f"ROI args invalid: {e}")
+            return
+        # quick pause if running
+        if while_running:
+            try: self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception: pass
+            try: self._ds.StopAcquisition()
+            except Exception: pass
+            self._clear_pool()
+        # ensure TLParamsUnlocked so Width/Height/Offsets are writable
+        try:
+            tln = self._nm.FindNode("TLParamsLocked")
+            if tln:
+                tln.SetValue(0)
+                print("[Worker] TLParamsLocked=0 for ROI")
+        except Exception:
+            pass
+        # optional: select Region0 if present (some cameras expose ROI via region selector)
+        try:
+            rs = self._nm.FindNode("RegionSelector")
+            if rs and hasattr(rs, "SetCurrentEntry"):
+                try:
+                    rs.SetCurrentEntry("Region0")
+                    print("[Worker] RegionSelector=Region0")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # offsets -> size -> offsets
+        try:
+            mnx = self._node_min("OffsetX"); mny = self._node_min("OffsetY")
+            if mnx is not None: self._nm.FindNode("OffsetX").SetValue(int(round(mnx)))
+            if mny is not None: self._nm.FindNode("OffsetY").SetValue(int(round(mny)))
+        except Exception:
+            pass
+        try:
+            wv = int(round(self._snap("Width", width)))
+            hv = int(round(self._snap("Height", height)))
+            print(f"[Worker] ROI size snapped -> Width={wv}, Height={hv}")
+            self._nm.FindNode("Width").SetValue(wv)
+            self._nm.FindNode("Height").SetValue(hv)
+        except Exception as e:
+            self.error.emit(f"ROI width/height failed: {e}")
+            return
+        try:
+            xv = int(round(self._snap("OffsetX", offx)))
+            yv = int(round(self._snap("OffsetY", offy)))
+            mx_x = self._node_max("OffsetX"); mx_y = self._node_max("OffsetY")
+            if mx_x is not None: xv = min(xv, int(round(mx_x)))
+            if mx_y is not None: yv = min(yv, int(round(mx_y)))
+            print(f"[Worker] ROI offsets snapped -> OffsetX={xv}, OffsetY={yv}")
+            self._nm.FindNode("OffsetX").SetValue(xv)
+            self._nm.FindNode("OffsetY").SetValue(yv)
+        except Exception as e:
+            self.error.emit(f"ROI offsets failed: {e}")
+            return
+        # rebuild pool
+        self._announce_and_queue()
+        # lock transport layer params again if we had unlocked
+        try:
+            tln = self._nm.FindNode("TLParamsLocked")
+            if tln:
+                tln.SetValue(1)
+                print("[Worker] TLParamsLocked=1 after ROI")
+        except Exception:
+            pass
+        # resume if running
+        if while_running:
+            try:
+                self._ds.StartAcquisition()
+                self._nm.FindNode("AcquisitionStart").Execute()
+                print("[Worker] resumed acquisition after ROI")
+            except Exception as e:
+                self.error.emit(f"ROI resume failed: {e}")
+        # publish
+        self.query_roi()
+
     # ---------- slots (run in worker thread) ----------
     @Slot()
     def start(self) -> None:
@@ -195,9 +286,14 @@ class _StreamWorker(QObject):
             print("[Worker] started acquisition")
 
             while self._run.is_set():
+                # process any pending ROI first
+                pending = self._pop_pending_roi()
+                if pending is not None:
+                    self._apply_roi_payload(pending, while_running=True)
+                    continue
                 buf = None
                 try:
-                    buf = self._ds.WaitForFinishedBuffer(10)  # short timeout for responsive stop
+                    buf = self._ds.WaitForFinishedBuffer(10)  # short timeout for responsiveness
                 except Exception:
                     continue
                 try:
@@ -227,7 +323,7 @@ class _StreamWorker(QObject):
                         try: self._ds.QueueBuffer(buf)
                         except Exception: pass
 
-            # Stop & clean pool (non-blocking to GUI)
+            # finalize stop
             print("[Worker] finalize stop begin")
             try:
                 self._nm.FindNode("AcquisitionStop").Execute()
@@ -259,7 +355,6 @@ class _StreamWorker(QObject):
         # Queued: runs only when the worker's event loop is free
         print("[Worker] request_stop (Queued) — clearing run flag and trying CancelWait")
         self._run.clear()
-        # Proactively try to break any blocking wait (if SDK supports it)
         try:
             cancel = getattr(self._ds, "CancelWait", None)
             if callable(cancel):
@@ -279,70 +374,20 @@ class _StreamWorker(QObject):
         self.roi.emit(out)
 
     @Slot(object)
-    def apply_roi(self, roi: object) -> None:
-        try:
-            print(f"[Worker] apply_roi received: {roi}")
-            # accept dict-like
-            try:
-                width = float(roi.get("Width"))
-                height = float(roi.get("Height"))
-                offx = float(roi.get("OffsetX"))
-                offy = float(roi.get("OffsetY"))
-            except Exception as e:
-                self.error.emit(f"ROI args invalid: {e}")
-                return
-            was_running = self._run.is_set()
-            if was_running:
-                # stop quickly (no GUI block)
-                self._run.clear()
-                try: self._nm.FindNode("AcquisitionStop").Execute()
-                except Exception: pass
-                try: self._ds.StopAcquisition()
-                except Exception: pass
-                self._clear_pool()
-            # safe order: offsets to min -> width/height -> offsets
-            try:
-                mnx = self._node_min("OffsetX"); mny = self._node_min("OffsetY")
-                if mnx is not None: self._nm.FindNode("OffsetX").SetValue(int(round(mnx)))
-                if mny is not None: self._nm.FindNode("OffsetY").SetValue(int(round(mny)))
-            except Exception: pass
-            try:
-                wv = int(round(self._snap("Width", width)))
-                hv = int(round(self._snap("Height", height)))
-                print(f"[Worker] ROI size snapped -> Width={wv}, Height={hv}")
-                self._nm.FindNode("Width").SetValue(wv)
-                self._nm.FindNode("Height").SetValue(hv)
-            except Exception as e:
-                self.error.emit(f"ROI width/height failed: {e}")
-                return
-            try:
-                xv = int(round(self._snap("OffsetX", offx)))
-                yv = int(round(self._snap("OffsetY", offy)))
-                # After size change, max offsets may have changed — re-clamp
-                mx_x = self._node_max("OffsetX"); mx_y = self._node_max("OffsetY")
-                if mx_x is not None: xv = min(xv, int(round(mx_x)))
-                if mx_y is not None: yv = min(yv, int(round(mx_y)))
-                print(f"[Worker] ROI offsets snapped -> OffsetX={xv}, OffsetY={yv}")
-                self._nm.FindNode("OffsetX").SetValue(xv)
-                self._nm.FindNode("OffsetY").SetValue(yv)
-            except Exception as e:
-                self.error.emit(f"ROI offsets failed: {e}")
-                return
-            # rebuild pool for new payload
-            self._announce_and_queue()
-            # if was running, restart
-            if was_running:
-                try:
-                    self._ds.StartAcquisition()
-                    self._nm.FindNode("AcquisitionStart").Execute()
-                    self._run.set(); self.started.emit()
-                    print("[Worker] restarted after ROI")
-                except Exception as e:
-                    self.error.emit(f"ROI restart failed: {e}")
-            # publish current ROI
-            self.query_roi()
-        except Exception as e:
-            self.error.emit(f"Apply ROI failed: {e}")
+    def enqueue_roi(self, roi: object) -> None:
+        # Lightweight mailbox setter; safe to call via DirectConnection from GUI thread
+        print(f"[Worker] enqueue_roi <- {roi}")
+        if not isinstance(roi, dict):
+            return
+        with self._roi_lock:
+            self._pending_roi = roi
+
+    @Slot()
+    def process_pending_roi(self) -> None:
+        # For the non-running case: apply immediately in worker thread
+        d = self._pop_pending_roi()
+        if d is not None:
+            self._apply_roi_payload(d, while_running=False)
 
     @Slot()
     def close(self) -> None:
@@ -368,8 +413,6 @@ class _StreamWorker(QObject):
 # Facade (GUI thread)
 # -----------------------------
 class IDSCamera(QObject):
-    # queued bridge to worker (safest way to pass Python objects across threads)
-    request_apply_roi = Signal(object)
     opened = Signal(str)
     started = Signal()
     stopped = Signal()
@@ -377,6 +420,8 @@ class IDSCamera(QObject):
     frame = Signal(object)
     error = Signal(str)
     roi = Signal(dict)
+    # Direct cross-thread ROI mailbox sender (carries a Python dict)
+    send_roi = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -436,8 +481,8 @@ class IDSCamera(QObject):
             self._worker.frame.connect(self.frame)
             self._worker.error.connect(self.error)
             self._worker.roi.connect(self.roi)
-            # connect queued ROI bridge
-            self.request_apply_roi.connect(self._worker.apply_roi, Qt.QueuedConnection)
+            # Wire direct ROI mailbox signal (runs slot in GUI thread via DirectConnection)
+            self.send_roi.connect(self._worker.enqueue_roi, Qt.DirectConnection)
             self._thread.start()
 
             self._st.open = True
@@ -479,13 +524,11 @@ class IDSCamera(QObject):
             return
         print(f"[UI] set_roi(w={w}, h={h}, x={x}, y={y}); acquiring={self._st.acquiring}")
         payload = {"Width": w, "Height": h, "OffsetX": x, "OffsetY": y}
-        # Emit request first so it's queued up
-        self.request_apply_roi.emit(payload)
-        if self._st.acquiring:
-            # Ensure the worker loop exits so it can process the queued ROI
-            print("[UI] set_roi: stopping stream to apply ROI")
-            QMetaObject.invokeMethod(self._worker, "set_stop_flag", Qt.DirectConnection)
-            QMetaObject.invokeMethod(self._worker, "request_stop", Qt.QueuedConnection)
+        # Drop into worker mailbox immediately via direct signal (safe: slot just locks and stores)
+        self.send_roi.emit(payload)
+        if not self._st.acquiring:
+            # If not running, ask worker to process it now in worker thread
+            QMetaObject.invokeMethod(self._worker, "process_pending_roi", Qt.QueuedConnection)
 
     @Slot()
     def refresh_roi(self) -> None:

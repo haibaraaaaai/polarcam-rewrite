@@ -1,10 +1,11 @@
 # ------------------------------------------
-# File: src/polarcam/ids_backend.py
-# (Clean build — Minimal + ROI + Timing, mailbox-based, with robust locks)
+# IDS backend: robust worker (ROI + Timing + Gains), buffer windowing,
+# pixel format forcing, safe snapping & float clamp.
 # ------------------------------------------
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from time import sleep
 from threading import Event, Lock
@@ -17,7 +18,7 @@ try:
     import ids_peak.ids_peak as ids
     from ids_peak import ids_peak_ipl_extension as ipl_ext
     _IDS_IMPORT_ERROR: Optional[str] = None
-except Exception as e:  # pragma: no cover (runtime check only)
+except Exception as e:  # pragma: no cover
     ids = None  # type: ignore
     ipl_ext = None  # type: ignore
     _IDS_IMPORT_ERROR = str(e)
@@ -32,13 +33,11 @@ class _State:
 # ---- Buffer policy (tunable) ----
 BUFFER_WINDOW_SEC = 0.20   # aim to buffer ~200 ms worth of frames
 BUFFER_MAX_COUNT = 128     # hard cap on count
-BUFFER_MAX_BYTES = 512 * 1024 * 1024  # ~512 MiB cap for buffers
+BUFFER_MAX_BYTES = 512 * 1024 * 1024  # ~512 MiB cap
 
 
 class _StreamWorker(QObject):
-    """Worker that *owns* the IDS datastream and camera node map.
-    All device I/O happens here to avoid races with the GUI thread.
-    """
+    """Worker that owns the IDS datastream and camera node map."""
 
     # Signals back to GUI
     started = Signal()
@@ -47,7 +46,8 @@ class _StreamWorker(QObject):
     frame = Signal(object)   # numpy array (mono)
     error = Signal(str)
     roi = Signal(dict)       # {Width, Height, OffsetX, OffsetY}
-    timing = Signal(dict)    # {fps, fps_min/max/inc, exposure_us, exposure_min/max/inc, resulting_fps, fps_writable}
+    timing = Signal(dict)    # {fps, exposure_us, resulting_fps, ...}
+    gains = Signal(dict)     # {'analog':{val,min,max,inc}, 'digital':{...}}
 
     def __init__(self, node_map, datastream) -> None:
         super().__init__()
@@ -56,11 +56,13 @@ class _StreamWorker(QObject):
         self._announced: List[object] = []
         self._run = Event()
         self._closed = False
-        # Mailboxes (thread-safe)
+        # Mailboxes
         self._roi_lock = Lock()
         self._pending_roi: Optional[Dict[str, Any]] = None
         self._tim_lock = Lock()
         self._pending_timing: Optional[Dict[str, Any]] = None
+        self._gain_lock = Lock()
+        self._pending_gains: Optional[Dict[str, Any]] = None
 
     # ---------- helpers ----------
     def _img_dims(self, img) -> Tuple[int, int]:
@@ -169,6 +171,21 @@ class _StreamWorker(QObject):
                 pass
             return False
 
+    def _force_mono_format(self) -> None:
+        """Try to force a simple grayscale output (Mono12 -> Mono16 -> Mono8)."""
+        try:
+            pf = self._nm.FindNode("PixelFormat")
+            if pf and hasattr(pf, "SetCurrentEntry"):
+                for candidate in ("Mono12", "Mono16", "Mono8"):
+                    try:
+                        pf.SetCurrentEntry(candidate)
+                        print(f"[Worker] PixelFormat -> {candidate}")
+                        return
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
     def _get_node(self, name: str):
         try:
             return self._nm.FindNode(name)
@@ -231,14 +248,21 @@ class _StreamWorker(QObject):
         mn = self._node_min(name)
         mx = self._node_max(name)
         inc = self._node_inc(name)
+        # clamp
         if mn is not None:
             value = max(value, mn)
         if mx is not None:
             value = min(value, mx)
+        # floor to step to avoid rounding just above max
         if inc and inc > 0:
             base = mn if mn is not None else 0.0
-            steps = round((value - base) / inc)
+            steps = math.floor((value - base) / inc + 1e-9)
             value = base + steps * inc
+        # epsilon clamp at top edge
+        if mx is not None and value > mx:
+            value = mx
+        if mx is not None and abs(value - mx) < 1e-7:
+            value = mx - (inc or 1e-3) * 1e-3
         return float(value)
 
     # ---------- ROI mailbox ----------
@@ -322,7 +346,8 @@ class _StreamWorker(QObject):
         except Exception as e:
             self.error.emit(f"ROI offsets failed: {e}")
             return
-        # rebuild pool (scale by requested fps if given)
+        # rebuild pool (force pixel format, then announce)
+        self._force_mono_format()
         self._announce_and_queue(desired_fps=None)
         # relock
         try:
@@ -369,12 +394,7 @@ class _StreamWorker(QObject):
         return d
 
     def _apply_timing_payload(self, d: Dict[str, Any], while_running: bool) -> None:
-        """Apply FPS / Exposure with safe ordering and pool handling.
-        Rules:
-          • If both provided, set EXPOSURE first (it changes FPS max), then set FPS.
-          • Snap both to node min/max/inc to avoid OutOfRange.
-          • If a set fails while running, soft‑pause, apply, rebuild buffers, then resume.
-        """
+        """Apply FPS / Exposure with safe ordering and pool handling."""
         print(f"[Worker] apply_timing while_running={while_running}: {d}")
         fps_req = d.get("fps")
         exp_ms_req = d.get("exposure_ms")
@@ -407,18 +427,20 @@ class _StreamWorker(QObject):
                 self.error.emit(f"Timing resume failed: {e}")
 
         def _rebuild_pool(desired_fps: Optional[float] = None) -> None:
-            # Re-announce and queue after a pause: some drivers flush the queue on Stop
             if self._announce_and_queue(desired_fps=desired_fps):
                 print("[Worker] buffer pool rebuilt for timing")
 
         _ensure_unlocked()
         paused = False
 
-        # Helper setters (snap + try; on failure optionally pause and retry)
         def _set_exposure(exp_ms: float) -> None:
             nonlocal paused
             exp_us = float(exp_ms) * 1000.0
             exp_us = self._snap("ExposureTime", exp_us)
+            # final guard against max epsilon
+            mx = self._node_max("ExposureTime")
+            if mx is not None and exp_us > mx:
+                exp_us = mx - 1e-3
             try:
                 auto = self._get_node("ExposureAuto")
                 if auto is not None and hasattr(auto, "SetCurrentEntry"):
@@ -460,19 +482,19 @@ class _StreamWorker(QObject):
                     except Exception as e2:
                         self.error.emit(f"Set FPS failed: {e2}")
 
-        # Decide order: if both supplied, set exposure first (so FPS max is up-to-date)
+        # If both supplied, set exposure first (it can change FPS max)
         if exp_ms_req is not None and fps_req is not None:
             _set_exposure(exp_ms_req)
             _set_fps(fps_req)
         else:
-            # Only one provided
             if fps_req is not None:
                 _set_fps(fps_req)
             if exp_ms_req is not None:
                 _set_exposure(exp_ms_req)
 
-        # If we paused, rebuild pool and resume
         if paused and while_running:
+            # Pixel format can flip on some models after timing changes; enforce
+            self._force_mono_format()
             _rebuild_pool(desired_fps=fps_req if fps_req is not None else None)
             # Relock before resume
             try:
@@ -484,7 +506,6 @@ class _StreamWorker(QObject):
                 pass
             _resume()
         else:
-            # Relock even if not paused
             try:
                 tln = self._nm.FindNode("TLParamsLocked")
                 if tln:
@@ -493,8 +514,129 @@ class _StreamWorker(QObject):
             except Exception:
                 pass
 
-        # Publish timing snapshot
         self.query_timing()
+
+    # ---------- Gains mailbox ----------
+    def _read_gains(self) -> Dict[str, Dict[str, Optional[float]]]:
+        out: Dict[str, Dict[str, Optional[float]]] = {"analog": {}, "digital": {}}
+        try:
+            # Analog
+            try:
+                sel = self._get_node("GainSelector")
+                if sel and hasattr(sel, "SetCurrentEntry"):
+                    try:
+                        sel.SetCurrentEntry("AnalogAll")
+                    except Exception:
+                        pass
+                g = self._get_node("Gain")
+                out["analog"]["val"] = self._node_value("Gain")
+                out["analog"]["min"] = self._node_min("Gain")
+                out["analog"]["max"] = self._node_max("Gain")
+                out["analog"]["inc"] = self._node_inc("Gain")
+            except Exception:
+                out["analog"] = {"val": None, "min": None, "max": None, "inc": None}
+            # Digital
+            try:
+                sel = self._get_node("GainSelector")
+                if sel and hasattr(sel, "SetCurrentEntry"):
+                    try:
+                        sel.SetCurrentEntry("DigitalAll")
+                    except Exception:
+                        pass
+                out["digital"]["val"] = self._node_value("Gain")
+                out["digital"]["min"] = self._node_min("Gain")
+                out["digital"]["max"] = self._node_max("Gain")
+                out["digital"]["inc"] = self._node_inc("Gain")
+            except Exception:
+                out["digital"] = {"val": None, "min": None, "max": None, "inc": None}
+        except Exception:
+            out = {"analog": {"val": None, "min": None, "max": None, "inc": None},
+                   "digital": {"val": None, "min": None, "max": None, "inc": None}}
+        return out
+
+    def _apply_gains_payload(self, d: Dict[str, Any], while_running: bool) -> None:
+        print(f"[Worker] apply_gains while_running={while_running}: {d}")
+        def _soft_pause():
+            try:
+                self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception:
+                pass
+            try:
+                self._ds.StopAcquisition()
+            except Exception:
+                pass
+
+        def _resume():
+            try:
+                self._ds.StartAcquisition()
+                self._nm.FindNode("AcquisitionStart").Execute()
+                print("[Worker] resumed acquisition after gains")
+            except Exception as e:
+                self.error.emit(f"Gains resume failed: {e}")
+
+        paused = False
+        # Safer on this camera: always pause when changing both/any gains during run
+        if while_running:
+            _soft_pause()
+            paused = True
+
+        # apply analog
+        if "analog" in d and d["analog"] is not None:
+            try:
+                sel = self._get_node("GainSelector")
+                if sel and hasattr(sel, "SetCurrentEntry"):
+                    try:
+                        sel.SetCurrentEntry("AnalogAll")
+                    except Exception:
+                        pass
+                val = float(d["analog"])
+                mn, mx, inc = self._node_min("Gain"), self._node_max("Gain"), self._node_inc("Gain")
+                if mn is not None:
+                    val = max(val, mn)
+                if mx is not None:
+                    val = min(val, mx)
+                if inc and inc > 0:
+                    base = mn if mn is not None else 0.0
+                    steps = math.floor((val - base) / inc + 1e-9)
+                    val = base + steps * inc
+                self._get_node("Gain").SetValue(val)
+                print(f"[Worker] set Analog Gain -> {val}")
+            except Exception as e:
+                self.error.emit(f"Set Analog Gain failed: {e}")
+
+        # apply digital
+        if "digital" in d and d["digital"] is not None:
+            try:
+                sel = self._get_node("GainSelector")
+                if sel and hasattr(sel, "SetCurrentEntry"):
+                    try:
+                        sel.SetCurrentEntry("DigitalAll")
+                    except Exception:
+                        pass
+                val = float(d["digital"])
+                mn, mx, inc = self._node_min("Gain"), self._node_max("Gain"), self._node_inc("Gain")
+                if mn is not None:
+                    val = max(val, mn)
+                if mx is not None:
+                    val = min(val, mx)
+                if inc and inc > 0:
+                    base = mn if mn is not None else 0.0
+                    steps = math.floor((val - base) / inc + 1e-9)
+                    val = base + steps * inc
+                self._get_node("Gain").SetValue(val)
+                print(f"[Worker] set Digital Gain -> {val}")
+            except Exception as e:
+                self.error.emit(f"Set Digital Gain failed: {e}")
+
+        if paused and while_running:
+            self._force_mono_format()
+            # No need to rebuild pool for gains, but some drivers like a re-queue
+            if self._announce_and_queue(desired_fps=None):
+                print("[Worker] buffer pool rebuilt for gains")
+            _resume()
+
+        # publish
+        self.gains.emit(self._read_gains())
 
     # ---------- slots (run in worker thread) ----------
     @Slot()
@@ -503,6 +645,7 @@ class _StreamWorker(QObject):
             return
         try:
             print("[Worker] start requested")
+            self._force_mono_format()
             if not self._announce_and_queue(desired_fps=None):
                 self.error.emit("Start failed: buffer pool not ready")
                 return
@@ -523,13 +666,21 @@ class _StreamWorker(QObject):
                 if pending_roi is not None:
                     self._apply_roi_payload(pending_roi, while_running=True)
                     continue
-                # Timing next (doesn't affect payload size)
+                # Timing next
                 with self._tim_lock:
                     t = self._pending_timing
                     self._pending_timing = None
                 if t is not None:
                     self._apply_timing_payload(t, while_running=True)
                     continue
+                # Gains next
+                with self._gain_lock:
+                    g = self._pending_gains
+                    self._pending_gains = None
+                if g is not None:
+                    self._apply_gains_payload(g, while_running=True)
+                    continue
+
                 buf = None
                 try:
                     buf = self._ds.WaitForFinishedBuffer(10)
@@ -652,6 +803,29 @@ class _StreamWorker(QObject):
         if d is not None:
             self._apply_timing_payload(d, while_running=False)
 
+    # ---- Gains API ----
+    @Slot()
+    def query_gains(self) -> None:
+        g = self._read_gains()
+        print(f"[Worker] gains -> {g}")
+        self.gains.emit(g)
+
+    @Slot(object)
+    def enqueue_gains(self, gains: object) -> None:
+        print(f"[Worker] enqueue_gains <- {gains}")
+        if not isinstance(gains, dict):
+            return
+        with self._gain_lock:
+            self._pending_gains = gains
+
+    @Slot()
+    def process_pending_gains(self) -> None:
+        with self._gain_lock:
+            g = self._pending_gains
+            self._pending_gains = None
+        if g is not None:
+            self._apply_gains_payload(g, while_running=False)
+
     @Slot()
     def close(self) -> None:
         if self._closed:
@@ -683,10 +857,12 @@ class IDSCamera(QObject):
     error = Signal(str)
     roi = Signal(dict)
     timing = Signal(dict)
+    gains = Signal(dict)
 
     # Direct cross-thread mailboxes
     send_roi = Signal(object)
     send_timing = Signal(object)
+    send_gains = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -756,8 +932,10 @@ class IDSCamera(QObject):
             self._worker.error.connect(self.error)
             self._worker.roi.connect(self.roi)
             self._worker.timing.connect(self.timing)
+            self._worker.gains.connect(self.gains)
             self.send_roi.connect(self._worker.enqueue_roi, Qt.DirectConnection)
             self.send_timing.connect(self._worker.enqueue_timing, Qt.DirectConnection)
+            self.send_gains.connect(self._worker.enqueue_gains, Qt.DirectConnection)
             self._thread.start()
 
             self._st.open = True
@@ -767,6 +945,7 @@ class IDSCamera(QObject):
             # initial snapshots
             QMetaObject.invokeMethod(self._worker, "query_roi", Qt.QueuedConnection)
             QMetaObject.invokeMethod(self._worker, "query_timing", Qt.QueuedConnection)
+            QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
         except Exception as e:
             self.error.emit(f"Failed to open device: {e}")
             self._cleanup_all()
@@ -782,6 +961,7 @@ class IDSCamera(QObject):
             return
         QMetaObject.invokeMethod(self._worker, "start", Qt.QueuedConnection)
         QMetaObject.invokeMethod(self._worker, "query_timing", Qt.QueuedConnection)
+        QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
 
     @Slot()
     def stop(self) -> None:
@@ -827,11 +1007,33 @@ class IDSCamera(QObject):
             QMetaObject.invokeMethod(self._worker, "process_pending_timing", Qt.QueuedConnection)
 
     @Slot()
+    def set_gains(self, analog: Optional[float], digital: Optional[float]) -> None:
+        if not self._worker:
+            print("[UI] set_gains ignored: no worker")
+            return
+        print(f"[UI] set_gains(analog={analog}, digital={digital}); acquiring={self._st.acquiring}")
+        payload: Dict[str, Optional[float]] = {}
+        if analog is not None:
+            payload["analog"] = float(analog)
+        if digital is not None:
+            payload["digital"] = float(digital)
+        self.send_gains.emit(payload)
+        if not self._st.acquiring:
+            QMetaObject.invokeMethod(self._worker, "process_pending_gains", Qt.QueuedConnection)
+
+    @Slot()
     def refresh_timing(self) -> None:
         if not self._worker:
             print("[UI] refresh_timing ignored: no worker")
             return
         QMetaObject.invokeMethod(self._worker, "query_timing", Qt.QueuedConnection)
+
+    @Slot()
+    def refresh_gains(self) -> None:
+        if not self._worker:
+            print("[UI] refresh_gains ignored: no worker")
+            return
+        QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
 
     @Slot()
     def close(self) -> None:

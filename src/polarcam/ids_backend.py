@@ -1053,7 +1053,13 @@ class IDSCamera(QObject):
         try:
             if self._thread:
                 self._thread.quit()
-                self._thread.wait(1000)
+                if not self._thread.wait(3000):  # was 1000
+                    # last resort on stubborn drivers
+                    try:
+                        self._thread.terminate()
+                        self._thread.wait(1000)
+                    except Exception:
+                        pass
         except Exception:
             pass
         self._worker = None

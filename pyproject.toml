@@ -13,6 +13,7 @@ dependencies = [
     "PySide6",
     "scikit-image",
     "scipy",
+    "matplotlib",
 ]
 
 [tool.setuptools.packages.find]

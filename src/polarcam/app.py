@@ -36,6 +36,9 @@ from PySide6.QtWidgets import (
 from skimage.morphology import binary_closing, binary_opening, remove_small_objects, disk
 from skimage.measure import label, regionprops
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
 from .ids_backend import IDSCamera
 
 
@@ -43,156 +46,126 @@ from .ids_backend import IDSCamera
 # Spot viewer (zoomed ROI + live 4-pol FFT numbers)
 # ============================================================
 class SpotViewerWindow(QMainWindow):
-    """Pop-up window that zooms ROI around a chosen spot and computes live FFTs
-    of the four polarization channels (0/45/90/135°)."""
-
+    """Pop-up window that zooms ROI around a chosen spot and shows a live 4-pol spectrum."""
     def __init__(self, cam: IDSCamera, spots, index: int, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Spot viewer — zoomed ROI + 4×pol FFT")
-        self.resize(1100, 640)
+        self.setWindowTitle("Spot viewer — zoomed ROI + 4×pol spectrum")
+        self.resize(1220, 720)
         self.cam = cam
         self.spots = list(spots)
         self.idx = int(max(0, min(index, len(self.spots) - 1)))
 
-        self._applied_roi = None  # (x, y, w, h) as actually applied by the camera
-        self.cam.roi.connect(self._on_roi_update, Qt.QueuedConnection)
-
-        # ==== UI ====
+        # ==== LEFT: zoomed video ====
         self.video = QLabel("Waiting for frames…")
         self.video.setAlignment(Qt.AlignCenter)
         self.video.setStyleSheet("background:#111; color:#777;")
 
-        self.lbl_fft0 = QLabel("0°: –")
-        self.lbl_fft45 = QLabel("45°: –")
-        self.lbl_fft90 = QLabel("90°: –")
-        self.lbl_fft135 = QLabel("135°: –")
-        for l in (self.lbl_fft0, self.lbl_fft45, self.lbl_fft90, self.lbl_fft135):
-            l.setStyleSheet("font: 14px 'Consolas','Courier New',monospace;")
+        # ==== RIGHT: spectrum plot + controls ====
+        self.fig = Figure(figsize=(5, 4), tight_layout=True)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_xlabel("Frequency (Hz)")
+        self.ax.set_ylabel("Power")
+        self.ax.grid(True, alpha=0.3)
+        self.canvas = FigureCanvas(self.fig)
 
+        # four line objects (created on first update)
+        self._line0 = self._line45 = self._line90 = self._line135 = None
+
+        # simple controls
+        self.spn_win = QSpinBox()
+        self.spn_win.setRange(64, 65536)
+        self.spn_win.setSingleStep(64)
+        self.spn_win.setValue(2048)     # default window length (samples)
+
+        self.spn_nfft = QSpinBox()
+        self.spn_nfft.setRange(256, 65536)
+        self.spn_nfft.setSingleStep(256)
+        self.spn_nfft.setValue(4096)    # default FFT length
+
+        self.lbl_win = QLabel("Window (samples)")
+        self.lbl_nfft = QLabel("NFFT")
+
+        ctl = QGridLayout()
+        ctl.addWidget(self.lbl_win, 0, 0); ctl.addWidget(self.spn_win, 0, 1)
+        ctl.addWidget(self.lbl_nfft, 1, 0); ctl.addWidget(self.spn_nfft, 1, 1)
+
+        # nav row
         self.btn_prev = QPushButton("◀ Prev")
         self.btn_next = QPushButton("Next ▶")
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.close)
-
-        left = QVBoxLayout()
-        left.addWidget(self.video, 1)
-
-        right = QVBoxLayout()
-        gb = QGroupBox("Live FFT peaks")
-        g = QGridLayout(gb)
-        g.addWidget(self.lbl_fft0, 0, 0)
-        g.addWidget(self.lbl_fft45, 1, 0)
-        g.addWidget(self.lbl_fft90, 2, 0)
-        g.addWidget(self.lbl_fft135, 3, 0)
-        right.addWidget(gb)
-
         nav = QHBoxLayout()
         nav.addWidget(self.btn_prev); nav.addWidget(self.btn_next); nav.addStretch(1); nav.addWidget(self.btn_close)
+
+        # right layout
+        right = QVBoxLayout()
+        right.addWidget(self.canvas, 1)
+        gb = QGroupBox("Spectrum settings")
+        gb.setLayout(ctl)
+        right.addWidget(gb)
         right.addLayout(nav)
 
+        # main split
+        left = QVBoxLayout(); left.addWidget(self.video, 1)
         w = QWidget(); h = QHBoxLayout(w)
-        h.addLayout(left, 2); h.addLayout(right, 1)
+        h.addLayout(left, 2); h.addLayout(right, 3)
         self.setCentralWidget(w)
 
         # ==== FFT state ====
         from collections import deque
-        self.WINDOW = 8000
-        self.NFFT = 32000
-        L = max(self.NFFT, self.WINDOW)
+        self.WINDOW = int(self.spn_win.value())
+        self.NFFT = int(self.spn_nfft.value())
+        L = max(self.NFFT, self.WINDOW, 4096)
         self._c0 = deque(maxlen=L); self._c45 = deque(maxlen=L)
         self._c90 = deque(maxlen=L); self._c135 = deque(maxlen=L)
-        self._zoom_roi = None  # (x, y, w, h)
+        self._zoom_roi = None            # requested (x, y, w, h)
+        self._applied_roi = None         # as reported by camera (snapped): (x, y, w, h)
+        self._fps = 20.0                 # updated from cam.timing
+        self._frame_count = 0            # throttle spectrum refresh
 
         # wiring
         self.btn_prev.clicked.connect(lambda: self._jump(-1))
         self.btn_next.clicked.connect(lambda: self._jump(+1))
+        self.spn_win.valueChanged.connect(self._on_win_changed)
+        self.spn_nfft.valueChanged.connect(self._on_nfft_changed)
+
+        # listen to ROI + timing so we get parity + fps
+        try:
+            self.cam.roi.connect(self._on_roi_update, Qt.QueuedConnection)
+        except Exception:
+            pass
+        try:
+            self.cam.timing.connect(self._on_timing_update, Qt.QueuedConnection)
+        except Exception:
+            pass
 
         # start feed
         QTimer.singleShot(0, self._show_current)
 
-    def _jump(self, d: int):
-        if not self.spots:
-            return
-        self.idx = (self.idx + d) % len(self.spots)
-        self._show_current()
+    # ----------------- controls -----------------
+    def _on_win_changed(self, v: int):
+        self.WINDOW = int(v)
+        # update deque maxlen if needed (grow only)
+        newL = max(self.NFFT, self.WINDOW, len(self._c0), 4096)
+        if newL > self._c0.maxlen:
+            self._resize_deques(newL)
 
-    def _show_current(self):
-        if not self.spots:
-            return
-        cx, cy, r, area, inten = self.spots[self.idx]
-        # build a small ROI around the spot
-        roi_w = roi_h = max(64, int(round(2.2 * r)))
-        x0 = int(max(0, round(cx - roi_w/2)))
-        y0 = int(max(0, round(cy - roi_h/2)))
-        self._zoom_roi = (x0, y0, roi_w, roi_h)
-        # stop stream, set ROI, start stream
-        self.cam.set_zoom_roi(self._zoom_roi)
-        # connect frame handler
-        self.cam.frame.connect(self._on_zoom_frame, Qt.QueuedConnection)
+    def _on_nfft_changed(self, v: int):
+        self.NFFT = int(v)
+        newL = max(self.NFFT, self.WINDOW, len(self._c0), 4096)
+        if newL > self._c0.maxlen:
+            self._resize_deques(newL)
 
-    def closeEvent(self, e):
-        try:
-            self.cam.clear_zoom_roi()
-            self.cam.frame.disconnect(self._on_zoom_frame)
-        except Exception:
-            pass
-        super().closeEvent(e)
+    def _resize_deques(self, newL: int):
+        def grow(dq, L):
+            tmp = list(dq)[-L:]
+            dq.clear()
+            dq.extend(tmp)
+            dq.maxlen = L
+        grow(self._c0, newL); grow(self._c45, newL)
+        grow(self._c90, newL); grow(self._c135, newL)
 
-    def _on_zoom_frame(self, arr_obj: object) -> None:
-        a = np.asarray(arr_obj)
-        if a.ndim != 2:
-            return
-        h, w = a.shape
-
-        # Compute spot center relative to the current frame
-        try:
-            cx, cy, r, _area, _inten = self.spots[self.idx]
-        except Exception:
-            return
-
-        # Use applied (snapped) ROI if we have it; else fall back to requested
-        if self._applied_roi is not None:
-            ax, ay, aw, ah = self._applied_roi
-        elif self._zoom_roi is not None:
-            ax, ay, aw, ah = self._zoom_roi
-        else:
-            ax = ay = 0
-
-        rel_cx = float(cx) - float(ax)
-        rel_cy = float(cy) - float(ay)
-
-        # Software square crop around the spot (limit to frame bounds)
-        # Side ~ 2.2*r, but clamp to sane limits
-        side = int(max(16, round(2.2 * max(4.0, float(r)))))
-        half = side // 2
-        x1 = max(0, min(w - 1, int(round(rel_cx)) - half))
-        y1 = max(0, min(h - 1, int(round(rel_cy)) - half))
-        x2 = min(w, x1 + side)
-        y2 = min(h, y1 + side)
-        if x2 <= x1 or y2 <= y1:
-            # fall back to full frame if something went odd
-            x1, y1, x2, y2 = 0, 0, w, h
-
-        a_crop = a[y1:y2, x1:x2]
-
-        # --- Display the crop ---
-        ch, cw = a_crop.shape
-        a8 = (a_crop >> 4).astype(np.uint8) if a_crop.dtype == np.uint16 else a_crop.astype(np.uint8, copy=False)
-        if not a8.flags.c_contiguous:
-            a8 = np.ascontiguousarray(a8)
-        qimg = QImage(a8.data, cw, ch, cw, QImage.Format_Grayscale8)
-        self.video.setPixmap(QPixmap.fromImage(qimg))
-
-        # --- Feed the FFT placeholders using the crop only ---
-        self._c0.append(int(a_crop.mean()))
-        self._c45.append(int(a_crop[ch//2:, :].mean()))
-        self._c90.append(int(a_crop[:, cw//2:].mean()))
-        self._c135.append(int(a_crop[:ch//2, :cw//2].mean()))
-        self.lbl_fft0.setText(f"0°: {self._c0[-1]}")
-        self.lbl_fft45.setText(f"45°: {self._c45[-1]}")
-        self.lbl_fft90.setText(f"90°: {self._c90[-1]}")
-        self.lbl_fft135.setText(f"135°: {self._c135[-1]}")
-
+    # ----------------- ROI + timing -----------------
     @Slot(dict)
     def _on_roi_update(self, d: dict) -> None:
         try:
@@ -204,6 +177,166 @@ class SpotViewerWindow(QMainWindow):
                 self._applied_roi = (x, y, w, h)
         except Exception:
             pass
+
+    @Slot(dict)
+    def _on_timing_update(self, d: dict) -> None:
+        try:
+            rf = d.get("resulting_fps") or d.get("fps")
+            if rf is not None:
+                self._fps = float(rf)
+        except Exception:
+            pass
+
+    # ----------------- navigation -----------------
+    def _jump(self, d: int):
+        if not self.spots:
+            return
+        self.idx = (self.idx + d) % len(self.spots)
+        self._show_current()
+
+    def _show_current(self):
+        if not self.spots:
+            return
+        cx, cy, r, area, inten = self.spots[self.idx]
+        # build a small ROI around the spot (will be snapped by driver)
+        roi_w = roi_h = max(64, int(round(2.2 * r)))
+        x0 = int(max(0, round(cx - roi_w/2)))
+        y0 = int(max(0, round(cy - roi_h/2)))
+        self._zoom_roi = (x0, y0, roi_w, roi_h)
+        self.cam.set_zoom_roi(self._zoom_roi)
+        try:
+            self.cam.frame.disconnect(self._on_zoom_frame)
+        except Exception:
+            pass
+        self.cam.frame.connect(self._on_zoom_frame, Qt.QueuedConnection)
+
+    def closeEvent(self, e):
+        try:
+            self.cam.clear_zoom_roi()
+            self.cam.frame.disconnect(self._on_zoom_frame)
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+    # ----------------- per-frame -----------------
+    def _on_zoom_frame(self, arr_obj: object) -> None:
+        a = np.asarray(arr_obj)
+        if a.ndim != 2:
+            return
+        H, W = a.shape
+
+        # 1) square crop around the current spot (software, independent of snapped ROI stripes)
+        try:
+            cx, cy, r, _area, _inten = self.spots[self.idx]
+        except Exception:
+            return
+
+        # absolute origin of the current view (for parity)
+        if self._applied_roi is not None:
+            ax, ay, aw, ah = self._applied_roi
+        elif self._zoom_roi is not None:
+            ax, ay, aw, ah = self._zoom_roi
+        else:
+            ax = ay = 0
+
+        rel_cx = float(cx) - float(ax)
+        rel_cy = float(cy) - float(ay)
+
+        side = int(max(16, round(2.2 * max(4.0, float(r)))))
+        half = side // 2
+        x1 = max(0, min(W - 1, int(round(rel_cx)) - half))
+        y1 = max(0, min(H - 1, int(round(rel_cy)) - half))
+        x2 = min(W, x1 + side)
+        y2 = min(H, y1 + side)
+        if x2 <= x1 or y2 <= y1:
+            x1, y1, x2, y2 = 0, 0, W, H
+        a_crop = a[y1:y2, x1:x2]
+
+        # 2) show crop in the left panel
+        ch, cw = a_crop.shape
+        a8 = (a_crop >> 4).astype(np.uint8) if a_crop.dtype == np.uint16 else a_crop.astype(np.uint8, copy=False)
+        if not a8.flags.c_contiguous:
+            a8 = np.ascontiguousarray(a8)
+        qimg = QImage(a8.data, cw, ch, cw, QImage.Format_Grayscale8)
+        self.video.setPixmap(QPixmap.fromImage(qimg))
+
+        # 3) accumulate per-pol means respecting the 2×2 mosaic parity
+        # Layout assumption (as documented in app): (0,0)=90°, (0,1)=45°, (1,0)=135°, (1,1)=0°
+        row0 = (ay + y1) & 1   # parity of the top row of the crop in sensor coords
+        col0 = (ax + x1) & 1   # parity of the left col of the crop in sensor coords
+
+        # channel slices
+        s90  = a_crop[row0::2,          col0::2]          # (0,0) -> 90°
+        s45  = a_crop[row0::2,          (col0 ^ 1)::2]    # (0,1) -> 45°
+        s135 = a_crop[(row0 ^ 1)::2,    col0::2]          # (1,0) -> 135°
+        s0   = a_crop[(row0 ^ 1)::2,    (col0 ^ 1)::2]    # (1,1) -> 0°
+
+        # per-frame means
+        m0   = float(s0.mean())   if s0.size   else 0.0
+        m45  = float(s45.mean())  if s45.size  else 0.0
+        m90  = float(s90.mean())  if s90.size  else 0.0
+        m135 = float(s135.mean()) if s135.size else 0.0
+
+        self._c0.append(m0); self._c45.append(m45); self._c90.append(m90); self._c135.append(m135)
+
+        # 4) update spectrum at ~4 Hz to keep UI snappy
+        self._frame_count = (self._frame_count + 1) % 4
+        if self._frame_count == 0:
+            self._update_spectrum()
+
+    # ----------------- spectrum -----------------
+    def _update_spectrum(self):
+        # choose window length and nfft
+        n = min(self.WINDOW, len(self._c0))
+        if n < 64 or self._fps <= 0.1:
+            return
+
+        # collect last n samples per channel
+        import numpy as _np
+        c0   = _np.asarray(list(self._c0)[-n:], dtype=_np.float64)
+        c45  = _np.asarray(list(self._c45)[-n:], dtype=_np.float64)
+        c90  = _np.asarray(list(self._c90)[-n:], dtype=_np.float64)
+        c135 = _np.asarray(list(self._c135)[-n:], dtype=_np.float64)
+
+        # detrend & window
+        def pre(x):
+            x = x - x.mean()
+            w = _np.hanning(len(x))
+            return x * w, (w**2).sum()
+
+        x0, w2_0 = pre(c0);   x45, w2_45 = pre(c45)
+        x90, w2_90 = pre(c90); x135, w2_135 = pre(c135)
+
+        # pick nfft (power of 2 up to NFFT)
+        nfft = 1 << int(_np.floor(_np.log2(max(256, min(self.NFFT, 4*n)))))
+        freqs = _np.fft.rfftfreq(nfft, d=1.0 / float(self._fps))
+
+        def ps(x, w2):
+            X = _np.fft.rfft(x, nfft)
+            P = (X.real**2 + X.imag**2) / max(1.0, w2)   # scaled power
+            return P
+
+        P0   = ps(x0,   w2_0)
+        P45  = ps(x45,  w2_45)
+        P90  = ps(x90,  w2_90)
+        P135 = ps(x135, w2_135)
+
+        # update plot
+        if self._line0 is None:
+            (self._line0,)   = self.ax.plot(freqs, P0,  label="0°")
+            (self._line45,)  = self.ax.plot(freqs, P45, label="45°")
+            (self._line90,)  = self.ax.plot(freqs, P90, label="90°")
+            (self._line135,) = self.ax.plot(freqs, P135,label="135°")
+            self.ax.legend(loc="upper right")
+        else:
+            self._line0.set_data(freqs, P0)
+            self._line45.set_data(freqs, P45)
+            self._line90.set_data(freqs, P90)
+            self._line135.set_data(freqs, P135)
+
+        # keep x/ y limits sensible
+        self.ax.relim(); self.ax.autoscale_view()
+        self.canvas.draw_idle()
 
 # ============================================================
 # Main window

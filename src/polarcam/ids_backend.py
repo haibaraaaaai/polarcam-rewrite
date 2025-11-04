@@ -172,19 +172,34 @@ class _StreamWorker(QObject):
             return False
 
     def _force_mono_format(self) -> None:
-        """Try to force a simple grayscale output (Mono12 -> Mono16 -> Mono8)."""
+        """Force a simple grayscale output (prefer Mono12), with safe unlock/relock."""
+        try:
+            tln = self._nm.FindNode("TLParamsLocked")
+            if tln:
+                tln.SetValue(0)
+                print("[Worker] TLParamsLocked=0 for PixelFormat")
+        except Exception:
+            pass
         try:
             pf = self._nm.FindNode("PixelFormat")
             if pf and hasattr(pf, "SetCurrentEntry"):
-                for candidate in ("Mono12", "Mono16", "Mono8"):
+                for candidate in ("Mono12", "Mono16", "Mono8", "Mono12p"):
                     try:
                         pf.SetCurrentEntry(candidate)
                         print(f"[Worker] PixelFormat -> {candidate}")
-                        return
+                        break
                     except Exception:
                         continue
         except Exception:
             pass
+        finally:
+            try:
+                tln = self._nm.FindNode("TLParamsLocked")
+                if tln:
+                    tln.SetValue(1)
+                    print("[Worker] TLParamsLocked=1 after PixelFormat")
+            except Exception:
+                pass
 
     def _get_node(self, name: str):
         try:
@@ -873,6 +888,9 @@ class IDSCamera(QObject):
         self._node_map = None
         self._worker: Optional[_StreamWorker] = None
         self._thread: Optional[QThread] = None
+        self._last_roi: dict = {}
+        self._zoom_prev_roi: Optional[Tuple[int, int, int, int]] = None  # (W,H,X,Y)
+        self.roi.connect(self._remember_roi)
 
     def _on_started(self) -> None:
         print("[UI] started() signal")
@@ -1048,6 +1066,54 @@ class IDSCamera(QObject):
         if self._worker:
             QMetaObject.invokeMethod(self._worker, "close", Qt.BlockingQueuedConnection)
         self._cleanup_all()
+
+    @Slot(dict)
+    def _remember_roi(self, d: dict) -> None:
+        """Keep a snapshot of the most recent ROI (as applied by the worker)."""
+        try:
+            out = {}
+            for k in ("Width", "Height", "OffsetX", "OffsetY"):
+                v = d.get(k)
+                if v is not None:
+                    out[k] = int(round(float(v)))
+            if out:
+                self._last_roi = out
+        except Exception:
+            pass
+
+    @Slot(object)
+    def set_zoom_roi(self, xywh: object) -> None:
+        """
+        Request a small ROI around a spot: (x, y, w, h).
+        On the first call, remember the current ROI so we can restore on close.
+        """
+        if not isinstance(xywh, (tuple, list)) or len(xywh) != 4:
+            print("[UI] set_zoom_roi ignored (bad tuple):", xywh); return
+        try:
+            x, y, w, h = [int(round(float(v))) for v in xywh]
+        except Exception:
+            print("[UI] set_zoom_roi ignored (parse failed):", xywh); return
+
+        if self._zoom_prev_roi is None:
+            lr = self._last_roi
+            if all(k in lr for k in ("Width", "Height", "OffsetX", "OffsetY")):
+                self._zoom_prev_roi = (lr["Width"], lr["Height"], lr["OffsetX"], lr["OffsetY"])
+            else:
+                # Ask worker to emit a fresh ROI snapshot for next time
+                if self._worker:
+                    QMetaObject.invokeMethod(self._worker, "query_roi", Qt.QueuedConnection)
+
+        # Apply (worker will snap to legal increments)
+        self.set_roi(w, h, x, y)
+
+    @Slot()
+    def clear_zoom_roi(self) -> None:
+        """Restore ROI that was active before the first set_zoom_roi()."""
+        if self._zoom_prev_roi is None:
+            print("[UI] clear_zoom_roi: nothing to restore"); return
+        w, h, x, y = self._zoom_prev_roi
+        self._zoom_prev_roi = None
+        self.set_roi(w, h, x, y)
 
     def _cleanup_all(self) -> None:
         try:

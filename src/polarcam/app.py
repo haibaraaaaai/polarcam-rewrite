@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QComboBox,
     QMessageBox,
+    QSizePolicy,
 )
 
 # scikit-image bits for one-shot detection
@@ -59,6 +60,8 @@ class SpotViewerWindow(QMainWindow):
         self.video = QLabel("Waiting for frames…")
         self.video.setAlignment(Qt.AlignCenter)
         self.video.setStyleSheet("background:#111; color:#777;")
+        self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._last_qimg_zoom = None
 
         # ==== RIGHT: spectrum plot + controls ====
         self.fig = Figure(figsize=(5, 4), tight_layout=True)
@@ -258,7 +261,7 @@ class SpotViewerWindow(QMainWindow):
         if not a8.flags.c_contiguous:
             a8 = np.ascontiguousarray(a8)
         qimg = QImage(a8.data, cw, ch, cw, QImage.Format_Grayscale8)
-        self.video.setPixmap(QPixmap.fromImage(qimg))
+        self._set_zoom_qimage(qimg)
 
         # 3) accumulate per-pol means respecting the 2×2 mosaic parity
         # Layout assumption (as documented in app): (0,0)=90°, (0,1)=45°, (1,0)=135°, (1,1)=0°
@@ -338,6 +341,24 @@ class SpotViewerWindow(QMainWindow):
         self.ax.relim(); self.ax.autoscale_view()
         self.canvas.draw_idle()
 
+    def _set_zoom_qimage(self, qimg: QImage) -> None:
+        self._last_qimg_zoom = qimg
+        if self.video.width() <= 1 or self.video.height() <= 1:
+            self.video.setPixmap(QPixmap.fromImage(qimg))
+            return
+        pm = QPixmap.fromImage(qimg).scaled(
+            self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.video.setPixmap(pm)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        try:
+            if self._last_qimg_zoom is not None:
+                self._set_zoom_qimage(self._last_qimg_zoom)
+        except Exception:
+            pass
+
 # ============================================================
 # Main window
 # ============================================================
@@ -355,6 +376,8 @@ class MainWindow(QMainWindow):
         self.video.setAlignment(Qt.AlignCenter)
         self.video.setStyleSheet("background:#111; color:#777;")
         self.video.setMinimumSize(640, 480)
+        self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._last_qimg_main = None
 
         self.btn_open = QPushButton("Open")
         self.btn_start = QPushButton("Start")
@@ -421,6 +444,9 @@ class MainWindow(QMainWindow):
         self._desat_target = 3900  # 95% of 4095 by default
         self._desat_connected = False
 
+        self._lut_log_u12_to_u8 = (np.log1p(np.arange(4096, dtype=np.float64))
+                           / np.log1p(4095.0) * 255.0).astype(np.uint8)
+
     # ---------- ROI dock ----------
     def _make_roi_dock(self) -> None:
         dock = QDockWidget("ROI", self)
@@ -457,6 +483,12 @@ class MainWindow(QMainWindow):
         f.addRow("Exposure (ms)", self.ed_exp)
         self.btn_apply_timing = QPushButton("Apply timing")
         f.addRow(self.btn_apply_timing)
+
+        # display mapping (12-bit -> 8-bit) for visualization only
+        self.cmb_vis = QComboBox()
+        self.cmb_vis.addItems(["12→8 (>>4)", "Auto stretch (1–99%)", "Log"])
+        f.addRow("View scale", self.cmb_vis)
+
         dock.setWidget(w)
         # wire
         self.btn_apply_timing.clicked.connect(self._apply_timing_clicked)
@@ -469,10 +501,10 @@ class MainWindow(QMainWindow):
         w = QWidget(); f = QFormLayout(w)
 
         # params
-        self.ed_dt = QLineEdit("10.0")     # ms between frames
-        self.ed_diff = QLineEdit("50")     # |Δ| threshold
-        self.ed_int = QLineEdit("200")     # intensity floor
-        self.ed_minA = QLineEdit("6")      # min area
+        self.ed_dt = QLineEdit("15.0")     # ms between frames
+        self.ed_diff = QLineEdit("500")     # |Δ| threshold
+        self.ed_int = QLineEdit("1000")     # intensity floor
+        self.ed_minA = QLineEdit("120")      # min area
         self.ed_maxA = QLineEdit("5000")   # max area
 
         # auto-desaturate controls
@@ -601,17 +633,19 @@ class MainWindow(QMainWindow):
 
     def _collect_for_detect(self, arr_obj: object) -> None:
         a = np.asarray(arr_obj)
-        # if auto-desat is running, feed that state machine and skip detection capture
+
+        # If auto-desat is running, feed that state machine and skip detect capture
         if self._desat_active:
             try:
                 self._on_auto_desat_frame(a)
             except Exception as e:
                 print(f"[AutoDesat] ERROR: {e}")
             return
+
         if a.ndim != 2:
             return
-        if a.ndim != 2:
-            return
+
+        # Collect frames with a fixed gap
         self._collect_frames.append(a.copy())
         need = self._collect_gap + 1
         have = len(self._collect_frames)
@@ -619,23 +653,26 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Detect: capturing {have}/{need}…", 0)
             print(f"[Detect] Captured {have}/{need} frames…")
             return
-        # got enough frames — stop listening and process
+
+        # Got enough frames — stop listening and process
         try:
             self.cam.frame.disconnect(self._collect_for_detect)
         except Exception:
             pass
         self._collecting = False
+
         prev = self._collect_frames[0]
-        cur = self._collect_frames[-1]
+        cur  = self._collect_frames[-1]
         print(f"[Detect] Processing pair: prev shape={prev.shape} dtype={prev.dtype}  cur shape={cur.shape} dtype={cur.dtype}")
         print(f"[Detect] Stats: prev[min={prev.min()} max={prev.max()}]  cur[min={cur.min()} max={cur.max()}]")
-        # parse thresholds
+
+        # Parse thresholds from UI
         def _num(le: QLineEdit, default: float) -> float:
             try:
                 return float(le.text())
             except Exception:
                 return default
-        diff_thr = _num(self.ed_diff, 50.0)
+        diff_thr  = _num(self.ed_diff, 50.0)
         inten_thr = _num(self.ed_int, 200.0)
         try: minA = int(float(self.ed_minA.text()))
         except Exception: minA = 6
@@ -643,101 +680,105 @@ class MainWindow(QMainWindow):
         except Exception: maxA = 5000
         print(f"[Detect] Thresholds: |Δ|≥{diff_thr}  I≥{inten_thr}  area∈[{minA},{maxA}]")
 
+        # ---- worker: polarization-binned diff + convex-hull centroid (ring→center) ----
         def _work(prev, cur, diff_thr, inten_thr, minA, maxA):
-            # NOTE: inten_thr is currently unused in the pure-diff pipeline (by request)
             t0 = time.perf_counter()
 
-            # ---- pure |Δ| (no pre-flooring) ----
-            prev32 = prev.astype(np.int32, copy=False)
-            cur32  = cur.astype(np.int32, copy=False)
-            diff   = np.abs(cur32 - prev32)
+            # 2x2 pol-binning: intensity = mean of the 4 sub-pixels (keeps 12-bit DN scale)
+            p00p = prev[0::2, 0::2].astype(np.uint32, copy=False)
+            p01p = prev[0::2, 1::2].astype(np.uint32, copy=False)
+            p10p = prev[1::2, 0::2].astype(np.uint32, copy=False)
+            p11p = prev[1::2, 1::2].astype(np.uint32, copy=False)
+            Iprev = ((p00p + p01p + p10p + p11p) // 4).astype(np.uint16, copy=False)
+
+            p00c = cur[0::2, 0::2].astype(np.uint32, copy=False)
+            p01c = cur[0::2, 1::2].astype(np.uint32, copy=False)
+            p10c = cur[1::2, 0::2].astype(np.uint32, copy=False)
+            p11c = cur[1::2, 1::2].astype(np.uint32, copy=False)
+            Icur = ((p00c + p01c + p10c + p11c) // 4).astype(np.uint16, copy=False)
+
+            # Difference on binned intensity (no pre-flooring)
+            diff = np.abs(Icur.astype(np.int32) - Iprev.astype(np.int32))
             t1 = time.perf_counter()
 
-            # threshold on diff only
-            mask0 = (diff >= diff_thr)
-            n_true0 = int(mask0.sum())
-            if not n_true0:
-                print(f"[Detect] mask empty (diff {1000*(t1-t0):.1f} ms).")
+            mask = (diff >= diff_thr)
+            n_true0 = int(mask.sum())
+
+            # Optional absolute intensity gate on current binned frame
+            if inten_thr > 0:
+                mask &= (Icur >= inten_thr)
+
+            if not bool(mask.any()):
+                print(f"[Detect] mask empty (bin+diff {1000*(t1-t0):.1f} ms).")
                 return []
 
-            # ---- morphology: Opening -> remove_small_objects -> Closing ----
-            # Opening first to de-speckle, use a slightly larger SE for robustness
-            se_open  = disk(2)
-            se_close = disk(1)
-
-            mask1 = binary_opening(mask0, se_open)
+            # Morphology tuned for rings: close (r=2) then open (r=1)
+            se_close = disk(2)
+            se_open  = disk(1)
+            mask = binary_closing(mask, se_close)
             t2 = time.perf_counter()
-
-            # Early cull dust before labeling; use minA as size cutoff
-            mask2 = remove_small_objects(mask1, min_size=max(1, int(minA)), connectivity=2)
+            mask = binary_opening(mask, se_open)
             t3 = time.perf_counter()
 
-            # Mend tiny gaps after de-speckle
-            mask3 = binary_closing(mask2, se_close)
+            # Connected components on binned grid
+            lbl = label(mask, connectivity=2)
             t4 = time.perf_counter()
-
-            # Label with 4-connectivity to reduce diagonal merging
-            lbl = label(mask3, connectivity=1)
-            t5 = time.perf_counter()
-
             nlab = int(lbl.max())
+
+            # Convert full-res area thresholds -> binned-grid area thresholds
+            minA_bin = max(1, int(np.ceil(minA / 4.0)))
+            maxA_bin = max(1, int(np.floor(maxA / 4.0)))
+
             dets = []
             for r in regionprops(lbl):
-                area = int(r.area)
-                if area < minA or area > maxA:
+                a_bin = int(r.area)
+                if a_bin < minA_bin or a_bin > maxA_bin:
                     continue
-                cy, cx = r.centroid
-                rad = float((area / np.pi) ** 0.5)
-                iy, ix = int(round(cy)), int(round(cx))
-                iy = max(0, min(cur.shape[0] - 1, iy))
-                ix = max(0, min(cur.shape[1] - 1, ix))
-                inten = int(cur[iy, ix])  # intensity from 'cur' frame
-                dets.append((float(cx), float(cy), rad, area, inten))
-            t6 = time.perf_counter()
 
+                # Use convex hull to land near the true center of a ring
+                hull = r.convex_image
+                if hull is None or hull.ndim != 2:
+                    cy_b, cx_b = r.centroid
+                else:
+                    yy, xx = np.nonzero(hull)
+                    if yy.size == 0:
+                        cy_b, cx_b = r.centroid
+                    else:
+                        cy_rel = float(yy.mean())
+                        cx_rel = float(xx.mean())
+                        minr, minc, _, _ = r.bbox
+                        cy_b = minr + cy_rel
+                        cx_b = minc + cx_rel
+
+                # Map binned coords back to full-res (center of the 2x2 block)
+                cx = (cx_b + 0.5) * 2.0
+                cy = (cy_b + 0.5) * 2.0
+
+                # Full-res equivalent area & radius
+                a_full = a_bin * 4.0
+                rad = float(np.sqrt(a_full / np.pi))
+
+                # Sample intensity at center from full-res current frame
+                iy = max(0, min(cur.shape[0] - 1, int(round(cy))))
+                ix = max(0, min(cur.shape[1] - 1, int(round(cx))))
+                inten = int(cur[iy, ix])
+
+                dets.append((float(cx), float(cy), rad, int(a_full), inten))
+
+            t5 = time.perf_counter()
             print(
-                "[Detect] timings: diff={:.1f}ms  open={:.1f}ms  smallobj={:.1f}ms  close={:.1f}ms  label={:.1f}ms  props={:.1f}ms  true0={}  true3={}  labels={}".format(
-                    1000 * (t1 - t0),
-                    1000 * (t2 - t1),
-                    1000 * (t3 - t2),
-                    1000 * (t4 - t3),
-                    1000 * (t5 - t4),
-                    1000 * (t6 - t5),
-                    n_true0,
-                    int(mask3.sum()),
-                    nlab,
+                "[Detect] timings: bin+diff={:.1f}ms  close={:.1f}ms  open={:.1f}ms  label={:.1f}ms  props={:.1f}ms  "
+                "true0={}  labels={}".format(
+                    1000 * (t1 - t0), 1000 * (t2 - t1), 1000 * (t3 - t2),
+                    1000 * (t4 - t3), 1000 * (t5 - t4), n_true0, nlab
                 )
             )
-            dets.sort(key=lambda t: -t[4])
+            dets.sort(key=lambda t: -t[4])  # sort by intensity desc
             return dets
 
-        fut = self._executor.submit(_work, prev, cur, diff_thr, inten_thr, minA, maxA)
+        # Submit worker and emit results via signal back to GUI thread
+        future = self._executor.submit(_work, prev, cur, diff_thr, inten_thr, minA, maxA)
         print("[Detect] Worker submitted")
-
-        def _post_detect_result(f):
-            try:
-                dets = f.result()
-            except Exception as e:
-                self._stop_detect_watchdog()
-                # recover UI and show message instead of hanging
-                try:
-                    self.btn_detect.setEnabled(True)
-                except Exception:
-                    pass
-                try:
-                    self.status.showMessage(f"Detect failed: {e}", 5000)
-                except Exception:
-                    pass
-                print(f"[Detect] ERROR: {e}")
-                return
-            self._stop_detect_watchdog()
-            elapsed_ms = (time.perf_counter() - self._detect_t0) * 1000.0
-            print(f"[Detect] Done: {len(dets)} spot(s) in {elapsed_ms:.1f} ms")
-            self._on_detect_ready(dets)
-            try:
-                self.status.showMessage(f"Detect: {len(dets)} spot(s) in {elapsed_ms:.0f} ms.", 3000)
-            except Exception:
-                pass
 
         def _emit_from_future(f):
             try:
@@ -745,7 +786,8 @@ class MainWindow(QMainWindow):
                 self.detect_done.emit(("ok", dets, self._detect_t0))
             except Exception as e:
                 self.detect_done.emit(("err", str(e), self._detect_t0))
-        fut.add_done_callback(_emit_from_future)
+
+        future.add_done_callback(_emit_from_future)
 
     def _on_detect_ready(self, dets: list) -> None:
         self._spots = dets or []
@@ -820,7 +862,7 @@ class MainWindow(QMainWindow):
         if a.ndim != 2:
             return
         h, w = a.shape
-        a8 = (a >> 4).astype(np.uint8) if a.dtype == np.uint16 else a.astype(np.uint8, copy=False)
+        a8 = self._gray8_from_u12(a)
         if not a8.flags.c_contiguous:
             a8 = np.ascontiguousarray(a8)
         qimg = QImage(a8.data, w, h, w, QImage.Format_Grayscale8)
@@ -837,7 +879,7 @@ class MainWindow(QMainWindow):
                 p.drawText(int(cx + 6), int(cy - 6), f"{i+1}  I={inten}  A={area}  {100.0*inten/full_scale:.1f}%")
             p.end()
 
-        self.video.setPixmap(QPixmap.fromImage(img))
+        self._set_video_qimage(img)
     def _on_roi(self, d: dict) -> None:
         """Update ROI fields from worker snapshot."""
         try:
@@ -1107,6 +1149,48 @@ class MainWindow(QMainWindow):
         # Shut down any detection worker
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    # --- display mapping (view only) ---
+    def _gray8_from_u12(self, a: np.ndarray) -> np.ndarray:
+        """Map 12-bit raw frame to 8-bit for display according to UI setting."""
+        if a.dtype != np.uint16:
+            return a.astype(np.uint8, copy=False)
+        mode = self.cmb_vis.currentText() if hasattr(self, "cmb_vis") else "12→8 (>>4)"
+        if mode.startswith("12→8"):
+            # exact divide-by-16
+            return (a >> 4).astype(np.uint8)
+        elif mode.startswith("Auto stretch"):
+            # fast percentile stretch on a 1/64th subsample to keep it snappy
+            s = a[::8, ::8]  # ~250x250 on full sensor
+            p1, p99 = np.percentile(s, (1, 99))
+            if p99 <= p1 + 1:
+                return (a >> 4).astype(np.uint8)
+            scaled = (np.clip(a, p1, p99) - p1) * (255.0 / (p99 - p1))
+            return scaled.astype(np.uint8)
+        elif mode.startswith("Log"):
+            # super fast: table lookup
+            return self._lut_log_u12_to_u8[a]
+
+    # --- scale-to-fit for QLabel ---
+    def _set_video_qimage(self, qimg: QImage) -> None:
+        """Scale qimg to fit the main video QLabel with aspect keep."""
+        self._last_qimg_main = qimg
+        if self.video.width() <= 1 or self.video.height() <= 1:
+            self.video.setPixmap(QPixmap.fromImage(qimg))
+            return
+        pm = QPixmap.fromImage(qimg).scaled(
+            self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.video.setPixmap(pm)
+
+    def resizeEvent(self, e):
+        # rescale last shown image to the new label size
+        super().resizeEvent(e)
+        try:
+            if hasattr(self, "_last_qimg_main") and self._last_qimg_main is not None:
+                self._set_video_qimage(self._last_qimg_main)
         except Exception:
             pass
 

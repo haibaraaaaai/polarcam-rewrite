@@ -1,26 +1,27 @@
 # ------------------------------------------
-# IDS backend: robust worker (ROI + Timing + Gains), buffer windowing,
-# pixel format forcing, safe snapping & float clamp.
+# IDS backend (ids_peak): robust worker thread
+# ROI + Timing + Gains mailboxes; buffer pool; Mono12 forcing.
+# Emits uint16 frames (12-bit data in 0..4095).
 # ------------------------------------------
-
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from time import sleep
 from threading import Event, Lock
+from time import sleep
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 from PySide6.QtCore import QObject, QThread, Signal, Slot, QMetaObject, Qt
 
-# ---- IDS imports (guarded) ----
+# ---- IDS imports (guarded so UI won’t explode if lib missing) ----
 try:
     import ids_peak.ids_peak as ids
     from ids_peak import ids_peak_ipl_extension as ipl_ext
     _IDS_IMPORT_ERROR: Optional[str] = None
 except Exception as e:  # pragma: no cover
-    ids = None  # type: ignore
-    ipl_ext = None  # type: ignore
+    ids = None           # type: ignore
+    ipl_ext = None       # type: ignore
     _IDS_IMPORT_ERROR = str(e)
 
 
@@ -31,22 +32,23 @@ class _State:
 
 
 # ---- Buffer policy (tunable) ----
-BUFFER_WINDOW_SEC = 0.20   # aim to buffer ~200 ms worth of frames
-BUFFER_MAX_COUNT = 128     # hard cap on count
-BUFFER_MAX_BYTES = 512 * 1024 * 1024  # ~512 MiB cap
+BUFFER_WINDOW_SEC = 0.20                 # ~200 ms of frames
+BUFFER_MAX_COUNT = 128                   # cap by count
+BUFFER_MAX_BYTES = 512 * 1024 * 1024     # cap by bytes (~512 MiB)
 
 
+# ==================================================================
+# Worker that owns the IDS datastream + node map. Lives in QThread.
+# ==================================================================
 class _StreamWorker(QObject):
-    """Worker that owns the IDS datastream and camera node map."""
-
-    # Signals back to GUI
+    # Signals → GUI thread
     started = Signal()
     stopped = Signal()
     closed = Signal()
-    frame = Signal(object)   # numpy array (mono)
+    frame = Signal(object)   # numpy array (H,W) uint16 0..4095
     error = Signal(str)
     roi = Signal(dict)       # {Width, Height, OffsetX, OffsetY}
-    timing = Signal(dict)    # {fps, exposure_us, resulting_fps, ...}
+    timing = Signal(dict)    # {fps, resulting_fps, exposure_us, ...}
     gains = Signal(dict)     # {'analog':{val,min,max,inc}, 'digital':{...}}
 
     def __init__(self, node_map, datastream) -> None:
@@ -56,151 +58,18 @@ class _StreamWorker(QObject):
         self._announced: List[object] = []
         self._run = Event()
         self._closed = False
-        # Mailboxes
+
+        # Mailboxes (set from GUI thread; read+clear in worker loop)
         self._roi_lock = Lock()
         self._pending_roi: Optional[Dict[str, Any]] = None
+
         self._tim_lock = Lock()
         self._pending_timing: Optional[Dict[str, Any]] = None
+
         self._gain_lock = Lock()
         self._pending_gains: Optional[Dict[str, Any]] = None
 
-    # ---------- helpers ----------
-    def _img_dims(self, img) -> Tuple[int, int]:
-        try:
-            return int(img.Width()), int(img.Height())
-        except Exception:
-            pass
-        try:
-            sz = img.Size()
-            w = getattr(sz, "width", None)
-            h = getattr(sz, "height", None)
-            if w is not None and h is not None:
-                return int(w), int(h)
-            W = getattr(sz, "Width", None)
-            H = getattr(sz, "Height", None)
-            if callable(W) and callable(H):
-                return int(W()), int(H())
-            if W is not None and H is not None:
-                return int(W), int(H)
-        except Exception:
-            pass
-        raise RuntimeError("Cannot obtain image size from IDS IPL image")
-
-    def _clear_pool(self) -> None:
-        try:
-            self._ds.Flush(ids.DataStreamFlushMode_DiscardAll)
-        except Exception:
-            pass
-        try:
-            for b in self._announced:
-                try:
-                    self._ds.RevokeBuffer(b)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        self._announced = []
-
-    def _current_payload_bytes(self) -> int:
-        try:
-            return int(self._nm.FindNode("PayloadSize").Value())
-        except Exception:
-            return 0
-
-    def _estimate_target_buffers(self, desired_fps: Optional[float] = None) -> Tuple[int, int, int]:
-        """Return (target_count, required_min, payload_bytes)."""
-        # required min from driver
-        try:
-            required = int(self._ds.NumBuffersAnnouncedMinRequired())
-        except Exception:
-            required = 3
-        required = max(required, 1)
-        # fps hint
-        fps = None
-        if desired_fps is not None:
-            try:
-                fps = float(desired_fps)
-            except Exception:
-                fps = None
-        if fps is None:
-            t = self._read_timing()
-            fps = (t.get("resulting_fps") or t.get("fps") or 30.0)
-            try:
-                fps = float(fps)  # type: ignore[arg-type]
-            except Exception:
-                fps = 30.0
-        # payload bytes
-        payload = self._current_payload_bytes()
-        # window-based target
-        window_count = int(max(1, round(float(fps) * BUFFER_WINDOW_SEC)))
-        base = max(8, 2 * required)
-        target = max(base, window_count)
-        # memory cap
-        if payload > 0:
-            max_by_mem = max(1, int(BUFFER_MAX_BYTES // payload))
-            target = min(target, BUFFER_MAX_COUNT, max_by_mem)
-        else:
-            target = min(target, BUFFER_MAX_COUNT)
-        return target, required, payload
-
-    def _announce_and_queue(self, desired_fps: Optional[float] = None) -> bool:
-        try:
-            self._clear_pool()
-            target, required, payload = self._estimate_target_buffers(desired_fps)
-            if payload <= 0:
-                self.error.emit("PayloadSize is 0")
-                return False
-            for _ in range(target):
-                buf = self._ds.AllocAndAnnounceBuffer(payload)
-                self._announced.append(buf)
-            for b in self._announced:
-                self._ds.QueueBuffer(b)
-            # tiny yield to let driver see queued buffers
-            sleep(0.005)
-            try:
-                mb = payload * len(self._announced)
-                print(f"[BufferPool] announced={len(self._announced)} required>={required} payload={payload} (~{mb/1048576:.1f} MiB)")
-            except Exception:
-                pass
-            return True
-        except Exception as e:
-            self.error.emit(f"Pool prepare failed: {e}")
-            try:
-                print("[Worker] pool prepare failed:", e)
-            except Exception:
-                pass
-            return False
-
-    def _force_mono_format(self) -> None:
-        """Force a simple grayscale output (prefer Mono12), with safe unlock/relock."""
-        try:
-            tln = self._nm.FindNode("TLParamsLocked")
-            if tln:
-                tln.SetValue(0)
-                print("[Worker] TLParamsLocked=0 for PixelFormat")
-        except Exception:
-            pass
-        try:
-            pf = self._nm.FindNode("PixelFormat")
-            if pf and hasattr(pf, "SetCurrentEntry"):
-                for candidate in ("Mono12", "Mono16", "Mono8", "Mono12p"):
-                    try:
-                        pf.SetCurrentEntry(candidate)
-                        print(f"[Worker] PixelFormat -> {candidate}")
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        finally:
-            try:
-                tln = self._nm.FindNode("TLParamsLocked")
-                if tln:
-                    tln.SetValue(1)
-                    print("[Worker] TLParamsLocked=1 after PixelFormat")
-            except Exception:
-                pass
-
+    # ---------- helpers: generic node access ----------
     def _get_node(self, name: str):
         try:
             return self._nm.FindNode(name)
@@ -211,12 +80,13 @@ class _StreamWorker(QObject):
         n = self._get_node(name)
         if n is None:
             return None
+        # value
         for attr in ("Value", "GetValue"):
             try:
                 return float(getattr(n, attr)())
             except Exception:
                 pass
-        # Some enums expose numeric-like Value on their current entry
+        # enum entry
         for attr in ("CurrentEntry", "GetCurrentEntry"):
             try:
                 e = getattr(n, attr)()
@@ -260,25 +130,124 @@ class _StreamWorker(QObject):
         return None
 
     def _snap(self, name: str, value: float) -> float:
+        """Clamp & snap a value to node min/max/inc."""
         mn = self._node_min(name)
         mx = self._node_max(name)
         inc = self._node_inc(name)
-        # clamp
-        if mn is not None:
-            value = max(value, mn)
-        if mx is not None:
-            value = min(value, mx)
-        # floor to step to avoid rounding just above max
+        v = float(value)
+        if mn is not None: v = max(v, mn)
+        if mx is not None: v = min(v, mx)
         if inc and inc > 0:
             base = mn if mn is not None else 0.0
-            steps = math.floor((value - base) / inc + 1e-9)
-            value = base + steps * inc
-        # epsilon clamp at top edge
-        if mx is not None and value > mx:
-            value = mx
-        if mx is not None and abs(value - mx) < 1e-7:
-            value = mx - (inc or 1e-3) * 1e-3
-        return float(value)
+            steps = math.floor((v - base) / inc + 1e-9)
+            v = base + steps * inc
+        if mx is not None and v > mx:
+            v = mx
+        # tiny nudge away from hard max (some IDS nodes reject exact max)
+        if mx is not None and abs(v - mx) < 1e-7:
+            v = mx - (inc or 1e-3) * 1e-3
+        return float(v)
+
+    # ---------- buffer pool ----------
+    def _current_payload_bytes(self) -> int:
+        try:
+            return int(self._nm.FindNode("PayloadSize").Value())
+        except Exception:
+            return 0
+
+    def _estimate_target_buffers(self, desired_fps: Optional[float] = None) -> Tuple[int, int, int]:
+        """Return (target_count, required_min, payload_bytes)."""
+        try:
+            required = int(self._ds.NumBuffersAnnouncedMinRequired())
+        except Exception:
+            required = 3
+        required = max(required, 1)
+
+        # pick FPS estimate
+        fps = None
+        if desired_fps is not None:
+            try: fps = float(desired_fps)
+            except Exception: fps = None
+        if fps is None:
+            t = self._read_timing()
+            fps = (t.get("resulting_fps") or t.get("fps") or 30.0)
+            try: fps = float(fps)  # type: ignore[arg-type]
+            except Exception: fps = 30.0
+
+        payload = self._current_payload_bytes()
+        window_count = int(max(1, round(float(fps) * BUFFER_WINDOW_SEC)))
+        base = max(8, 2 * required)
+        target = max(base, window_count)
+
+        if payload > 0:
+            max_by_mem = max(1, int(BUFFER_MAX_BYTES // payload))
+            target = min(target, BUFFER_MAX_COUNT, max_by_mem)
+        else:
+            target = min(target, BUFFER_MAX_COUNT)
+        return target, required, payload
+
+    def _clear_pool(self) -> None:
+        try: self._ds.Flush(ids.DataStreamFlushMode_DiscardAll)
+        except Exception: pass
+        try:
+            for b in self._announced:
+                try: self._ds.RevokeBuffer(b)
+                except Exception: pass
+        except Exception:
+            pass
+        self._announced = []
+
+    def _announce_and_queue(self, desired_fps: Optional[float] = None) -> bool:
+        try:
+            self._clear_pool()
+            target, required, payload = self._estimate_target_buffers(desired_fps)
+            if payload <= 0:
+                self.error.emit("PayloadSize is 0")
+                return False
+            for _ in range(target):
+                buf = self._ds.AllocAndAnnounceBuffer(payload)
+                self._announced.append(buf)
+            for b in self._announced:
+                self._ds.QueueBuffer(b)
+            sleep(0.005)
+            try:
+                mb = payload * len(self._announced)
+                print(f"[BufferPool] announced={len(self._announced)} required>={required} payload={payload} (~{mb/1048576:.1f} MiB)")
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            self.error.emit(f"Pool prepare failed: {e}")
+            print("[Worker] pool prepare failed:", e)
+            return False
+
+    # ---------- pixel format ----------
+    def _force_mono_format(self) -> None:
+        """Force grayscale output (prefer Mono12)."""
+        try:
+            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
+            print("[Worker] TLParamsLocked=0 for PixelFormat")
+        except Exception:
+            pass
+        try:
+            pf = self._nm.FindNode("PixelFormat")
+            if pf and hasattr(pf, "SetCurrentEntry"):
+                # Try your preferred ordering
+                for cand in ("Mono12", "Mono16", "Mono8", "Mono12p"):
+                    try:
+                        pf.SetCurrentEntry(cand)
+                        print(f"[Worker] PixelFormat -> {cand}")
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        finally:
+            try:
+                tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(1)
+                print("[Worker] TLParamsLocked=1 after PixelFormat")
+            except Exception:
+                pass
 
     # ---------- ROI mailbox ----------
     def _pop_pending_roi(self) -> Optional[Dict[str, Any]]:
@@ -287,92 +256,81 @@ class _StreamWorker(QObject):
             self._pending_roi = None
             return d
 
+    def _img_dims(self, img) -> Tuple[int, int]:
+        try:
+            return int(img.Width()), int(img.Height())
+        except Exception:
+            pass
+        try:
+            sz = img.Size()
+            w = getattr(sz, "width", None); h = getattr(sz, "height", None)
+            if w is not None and h is not None: return int(w), int(h)
+            W = getattr(sz, "Width", None); H = getattr(sz, "Height", None)
+            if callable(W) and callable(H): return int(W()), int(H())
+            if W is not None and H is not None: return int(W), int(H)
+        except Exception:
+            pass
+        raise RuntimeError("Cannot obtain image size from IDS IPL image")
+
     def _apply_roi_payload(self, d: Dict[str, Any], while_running: bool) -> None:
         try:
-            print(f"[Worker] apply_roi(payload) while_running={while_running}: {d}")
-            width = float(d.get("Width"))
-            height = float(d.get("Height"))
-            offx = float(d.get("OffsetX"))
-            offy = float(d.get("OffsetY"))
+            w = float(d.get("Width")); h = float(d.get("Height"))
+            x = float(d.get("OffsetX")); y = float(d.get("OffsetY"))
+            print(f"[Worker] apply_roi while_running={while_running}: W={w} H={h} X={x} Y={y}")
         except Exception as e:
             self.error.emit(f"ROI args invalid: {e}")
             return
-        # quick pause if running
+
+        # pause if needed
         if while_running:
-            try:
-                self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception:
-                pass
-            try:
-                self._ds.StopAcquisition()
-            except Exception:
-                pass
+            try: self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception: pass
+            try: self._ds.StopAcquisition()
+            except Exception: pass
             self._clear_pool()
-        # ensure unlock so ROI nodes are writable
+
+        # unlock
         try:
-            tln = self._nm.FindNode("TLParamsLocked")
-            if tln:
-                tln.SetValue(0)
-                print("[Worker] TLParamsLocked=0 for ROI")
+            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
+            print("[Worker] TLParamsLocked=0 for ROI")
         except Exception:
             pass
-        # optional: some cameras require setting region selector
+
+        # set size first (resets offsets to allowed ranges)
         try:
-            rs = self._nm.FindNode("RegionSelector")
-            if rs and hasattr(rs, "SetCurrentEntry"):
-                try:
-                    rs.SetCurrentEntry("Region0")
-                    print("[Worker] RegionSelector=Region0")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # offsets -> size -> offsets
-        try:
-            mnx = self._node_min("OffsetX")
-            mny = self._node_min("OffsetY")
-            if mnx is not None:
-                self._nm.FindNode("OffsetX").SetValue(int(round(mnx)))
-            if mny is not None:
-                self._nm.FindNode("OffsetY").SetValue(int(round(mny)))
-        except Exception:
-            pass
-        try:
-            wv = int(round(self._snap("Width", width)))
-            hv = int(round(self._snap("Height", height)))
-            print(f"[Worker] ROI size snapped -> Width={wv}, Height={hv}")
+            wv = int(round(self._snap("Width",  w)))
+            hv = int(round(self._snap("Height", h)))
             self._nm.FindNode("Width").SetValue(wv)
             self._nm.FindNode("Height").SetValue(hv)
+            print(f"[Worker] ROI size -> Width={wv} Height={hv}")
         except Exception as e:
             self.error.emit(f"ROI width/height failed: {e}")
             return
+
+        # then offsets
         try:
-            xv = int(round(self._snap("OffsetX", offx)))
-            yv = int(round(self._snap("OffsetY", offy)))
-            mx_x = self._node_max("OffsetX")
-            mx_y = self._node_max("OffsetY")
-            if mx_x is not None:
-                xv = min(xv, int(round(mx_x)))
-            if mx_y is not None:
-                yv = min(yv, int(round(mx_y)))
-            print(f"[Worker] ROI offsets snapped -> OffsetX={xv}, OffsetY={yv}")
+            xv = int(round(self._snap("OffsetX", x)))
+            yv = int(round(self._snap("OffsetY", y)))
+            mx_x = self._node_max("OffsetX"); mx_y = self._node_max("OffsetY")
+            if mx_x is not None: xv = min(xv, int(round(mx_x)))
+            if mx_y is not None: yv = min(yv, int(round(mx_y)))
             self._nm.FindNode("OffsetX").SetValue(xv)
             self._nm.FindNode("OffsetY").SetValue(yv)
+            print(f"[Worker] ROI offsets -> X={xv} Y={yv}")
         except Exception as e:
             self.error.emit(f"ROI offsets failed: {e}")
             return
-        # rebuild pool (force pixel format, then announce)
+
+        # re-arm buffers + relock
         self._force_mono_format()
         self._announce_and_queue(desired_fps=None)
-        # relock
         try:
-            tln = self._nm.FindNode("TLParamsLocked")
-            if tln:
-                tln.SetValue(1)
-                print("[Worker] TLParamsLocked=1 after ROI")
+            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(1)
+            print("[Worker] TLParamsLocked=1 after ROI")
         except Exception:
             pass
-        # resume if running
+
+        # resume if needed
         if while_running:
             try:
                 self._ds.StartAcquisition()
@@ -380,9 +338,53 @@ class _StreamWorker(QObject):
                 print("[Worker] resumed acquisition after ROI")
             except Exception as e:
                 self.error.emit(f"ROI resume failed: {e}")
-        # publish
+
         self.query_roi()
         self.query_timing()
+
+    def _apply_full_sensor(self, while_running: bool) -> None:
+        if while_running:
+            try: self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception: pass
+            try: self._ds.StopAcquisition()
+            except Exception: pass
+            self._clear_pool()
+
+        try:
+            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
+            # reset offsets to minima
+            for key in ("OffsetX", "OffsetY"):
+                mn = self._node_min(key)
+                if mn is not None:
+                    self._nm.FindNode(key).SetValue(int(round(mn)))
+            # set max size
+            wmx = self._node_max("Width"); hmx = self._node_max("Height")
+            if wmx is not None: self._nm.FindNode("Width").SetValue(int(round(wmx)))
+            if hmx is not None: self._nm.FindNode("Height").SetValue(int(round(hmx)))
+            tln and tln.SetValue(1)
+        except Exception as e:
+            self.error.emit(f"Full sensor failed: {e}")
+            return
+
+        self._force_mono_format()
+        self._announce_and_queue(desired_fps=None)
+
+        if while_running:
+            try:
+                self._ds.StartAcquisition()
+                self._nm.FindNode("AcquisitionStart").Execute()
+                print("[Worker] resumed acquisition after ROI(full)")
+            except Exception as e:
+                self.error.emit(f"ROI resume failed: {e}")
+
+        self.query_roi()
+        self.query_timing()
+
+    @Slot()
+    def enqueue_full_sensor(self) -> None:
+        # Reuse the ROI mailbox with a sentinel key
+        with self._roi_lock:
+            self._pending_roi = {"__full__": True}
 
     # ---------- Timing mailbox ----------
     def _read_timing(self) -> Dict[str, Union[float, bool, None]]:
@@ -395,45 +397,34 @@ class _StreamWorker(QObject):
             d["fps_max"] = self._node_max("AcquisitionFrameRate")
             d["fps_inc"] = self._node_inc("AcquisitionFrameRate")
         else:
-            d["fps"] = None
-            d["fps_min"] = None
-            d["fps_max"] = None
-            d["fps_inc"] = None
+            d["fps"] = d["fps_min"] = d["fps_max"] = d["fps_inc"] = None
         rf = self._node_value("ResultingFrameRate")
-        if rf is not None:
-            d["resulting_fps"] = rf
-        d["exposure_us"] = self._node_value("ExposureTime")
+        if rf is not None: d["resulting_fps"] = rf
+        d["exposure_us"]  = self._node_value("ExposureTime")
         d["exposure_min"] = self._node_min("ExposureTime")
         d["exposure_max"] = self._node_max("ExposureTime")
         d["exposure_inc"] = self._node_inc("ExposureTime")
         return d
 
     def _apply_timing_payload(self, d: Dict[str, Any], while_running: bool) -> None:
-        """Apply FPS / Exposure with safe ordering and pool handling."""
         print(f"[Worker] apply_timing while_running={while_running}: {d}")
         fps_req = d.get("fps")
         exp_ms_req = d.get("exposure_ms")
 
-        def _ensure_unlocked() -> None:
+        def _unlock():
             try:
-                tln = self._nm.FindNode("TLParamsLocked")
-                if tln:
-                    tln.SetValue(0)
-                    print("[Worker] TLParamsLocked=0 for timing")
+                tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
+                print("[Worker] TLParamsLocked=0 for timing")
             except Exception:
                 pass
 
-        def _soft_pause() -> None:
-            try:
-                self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception:
-                pass
-            try:
-                self._ds.StopAcquisition()
-            except Exception:
-                pass
+        def _pause():
+            try: self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception: pass
+            try: self._ds.StopAcquisition()
+            except Exception: pass
 
-        def _resume() -> None:
+        def _resume():
             try:
                 self._ds.StartAcquisition()
                 self._nm.FindNode("AcquisitionStart").Execute()
@@ -441,93 +432,64 @@ class _StreamWorker(QObject):
             except Exception as e:
                 self.error.emit(f"Timing resume failed: {e}")
 
-        def _rebuild_pool(desired_fps: Optional[float] = None) -> None:
-            if self._announce_and_queue(desired_fps=desired_fps):
-                print("[Worker] buffer pool rebuilt for timing")
+        def _rebuild_pool(desired_fps: Optional[float] = None):
+            if self._announce_and_queue(desired_fps): print("[Worker] buffer pool rebuilt for timing")
 
-        _ensure_unlocked()
+        _unlock()
         paused = False
 
-        def _set_exposure(exp_ms: float) -> None:
+        # Exposure first (it can change FPS caps)
+        def _set_exposure(exp_ms: float):
             nonlocal paused
-            exp_us = float(exp_ms) * 1000.0
-            exp_us = self._snap("ExposureTime", exp_us)
-            # final guard against max epsilon
-            mx = self._node_max("ExposureTime")
-            if mx is not None and exp_us > mx:
-                exp_us = mx - 1e-3
+            exp_us = self._snap("ExposureTime", float(exp_ms) * 1000.0)
             try:
                 auto = self._get_node("ExposureAuto")
-                if auto is not None and hasattr(auto, "SetCurrentEntry"):
-                    try:
-                        auto.SetCurrentEntry("Off")
-                    except Exception:
-                        pass
+                if auto and hasattr(auto, "SetCurrentEntry"):
+                    try: auto.SetCurrentEntry("Off")
+                    except Exception: pass
                 self._get_node("ExposureTime").SetValue(exp_us)
                 print(f"[Worker] set Exposure -> {exp_us} us")
             except Exception as e:
-                print(f"[Worker] set Exposure failed (will try paused): {e}")
                 if while_running and not paused:
-                    _soft_pause(); paused = True
+                    _pause(); paused = True
                     try:
                         self._get_node("ExposureTime").SetValue(exp_us)
                         print(f"[Worker] set Exposure (paused) -> {exp_us} us")
                     except Exception as e2:
                         self.error.emit(f"Set Exposure failed: {e2}")
 
-        def _set_fps(fps_val: float) -> None:
+        def _set_fps(fps_val: float):
             nonlocal paused
             fps_snapped = self._snap("AcquisitionFrameRate", float(fps_val))
             try:
                 en = self._get_node("AcquisitionFrameRateEnable")
                 if en is not None:
-                    try:
-                        en.SetValue(True)
-                    except Exception:
-                        pass
+                    try: en.SetValue(True)
+                    except Exception: pass
                 self._get_node("AcquisitionFrameRate").SetValue(fps_snapped)
                 print(f"[Worker] set FPS -> {fps_snapped}")
             except Exception as e:
-                print(f"[Worker] set FPS failed (will try paused): {e}")
                 if while_running and not paused:
-                    _soft_pause(); paused = True
+                    _pause(); paused = True
                     try:
                         self._get_node("AcquisitionFrameRate").SetValue(fps_snapped)
                         print(f"[Worker] set FPS (paused) -> {fps_snapped}")
                     except Exception as e2:
                         self.error.emit(f"Set FPS failed: {e2}")
 
-        # If both supplied, set exposure first (it can change FPS max)
-        if exp_ms_req is not None and fps_req is not None:
-            _set_exposure(exp_ms_req)
-            _set_fps(fps_req)
-        else:
-            if fps_req is not None:
-                _set_fps(fps_req)
-            if exp_ms_req is not None:
-                _set_exposure(exp_ms_req)
+        if exp_ms_req is not None: _set_exposure(exp_ms_req)
+        if fps_req is not None:    _set_fps(fps_req)
 
+        # relock + maybe rebuild + resume
+        try:
+            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(1)
+            print("[Worker] TLParamsLocked=1 after timing")
+        except Exception:
+            pass
         if paused and while_running:
-            # Pixel format can flip on some models after timing changes; enforce
             self._force_mono_format()
             _rebuild_pool(desired_fps=fps_req if fps_req is not None else None)
-            # Relock before resume
-            try:
-                tln = self._nm.FindNode("TLParamsLocked")
-                if tln:
-                    tln.SetValue(1)
-                    print("[Worker] TLParamsLocked=1 after timing")
-            except Exception:
-                pass
             _resume()
-        else:
-            try:
-                tln = self._nm.FindNode("TLParamsLocked")
-                if tln:
-                    tln.SetValue(1)
-                    print("[Worker] TLParamsLocked=1 after timing")
-            except Exception:
-                pass
 
         self.query_timing()
 
@@ -539,11 +501,8 @@ class _StreamWorker(QObject):
             try:
                 sel = self._get_node("GainSelector")
                 if sel and hasattr(sel, "SetCurrentEntry"):
-                    try:
-                        sel.SetCurrentEntry("AnalogAll")
-                    except Exception:
-                        pass
-                g = self._get_node("Gain")
+                    try: sel.SetCurrentEntry("AnalogAll")
+                    except Exception: pass
                 out["analog"]["val"] = self._node_value("Gain")
                 out["analog"]["min"] = self._node_min("Gain")
                 out["analog"]["max"] = self._node_max("Gain")
@@ -554,10 +513,8 @@ class _StreamWorker(QObject):
             try:
                 sel = self._get_node("GainSelector")
                 if sel and hasattr(sel, "SetCurrentEntry"):
-                    try:
-                        sel.SetCurrentEntry("DigitalAll")
-                    except Exception:
-                        pass
+                    try: sel.SetCurrentEntry("DigitalAll")
+                    except Exception: pass
                 out["digital"]["val"] = self._node_value("Gain")
                 out["digital"]["min"] = self._node_min("Gain")
                 out["digital"]["max"] = self._node_max("Gain")
@@ -571,15 +528,12 @@ class _StreamWorker(QObject):
 
     def _apply_gains_payload(self, d: Dict[str, Any], while_running: bool) -> None:
         print(f"[Worker] apply_gains while_running={while_running}: {d}")
-        def _soft_pause():
-            try:
-                self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception:
-                pass
-            try:
-                self._ds.StopAcquisition()
-            except Exception:
-                pass
+
+        def _pause():
+            try: self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception: pass
+            try: self._ds.StopAcquisition()
+            except Exception: pass
 
         def _resume():
             try:
@@ -590,70 +544,41 @@ class _StreamWorker(QObject):
                 self.error.emit(f"Gains resume failed: {e}")
 
         paused = False
-        # Safer on this camera: always pause when changing both/any gains during run
-        if while_running:
-            _soft_pause()
-            paused = True
+        if while_running: _pause(); paused = True
 
-        # apply analog
+        def _set_gain(sel_name: str, val: float):
+            try:
+                sel = self._get_node("GainSelector")
+                if sel and hasattr(sel, "SetCurrentEntry"):
+                    try: sel.SetCurrentEntry(sel_name)
+                    except Exception: pass
+                v = float(val)
+                mn, mx, inc = self._node_min("Gain"), self._node_max("Gain"), self._node_inc("Gain")
+                if mn is not None: v = max(v, mn)
+                if mx is not None: v = min(v, mx)
+                if inc and inc > 0:
+                    base = mn if mn is not None else 0.0
+                    steps = math.floor((v - base) / inc + 1e-9)
+                    v = base + steps * inc
+                self._get_node("Gain").SetValue(v)
+                print(f"[Worker] set {sel_name} Gain -> {v}")
+            except Exception as e:
+                self.error.emit(f"Set {sel_name} Gain failed: {e}")
+
         if "analog" in d and d["analog"] is not None:
-            try:
-                sel = self._get_node("GainSelector")
-                if sel and hasattr(sel, "SetCurrentEntry"):
-                    try:
-                        sel.SetCurrentEntry("AnalogAll")
-                    except Exception:
-                        pass
-                val = float(d["analog"])
-                mn, mx, inc = self._node_min("Gain"), self._node_max("Gain"), self._node_inc("Gain")
-                if mn is not None:
-                    val = max(val, mn)
-                if mx is not None:
-                    val = min(val, mx)
-                if inc and inc > 0:
-                    base = mn if mn is not None else 0.0
-                    steps = math.floor((val - base) / inc + 1e-9)
-                    val = base + steps * inc
-                self._get_node("Gain").SetValue(val)
-                print(f"[Worker] set Analog Gain -> {val}")
-            except Exception as e:
-                self.error.emit(f"Set Analog Gain failed: {e}")
-
-        # apply digital
+            _set_gain("AnalogAll", float(d["analog"]))
         if "digital" in d and d["digital"] is not None:
-            try:
-                sel = self._get_node("GainSelector")
-                if sel and hasattr(sel, "SetCurrentEntry"):
-                    try:
-                        sel.SetCurrentEntry("DigitalAll")
-                    except Exception:
-                        pass
-                val = float(d["digital"])
-                mn, mx, inc = self._node_min("Gain"), self._node_max("Gain"), self._node_inc("Gain")
-                if mn is not None:
-                    val = max(val, mn)
-                if mx is not None:
-                    val = min(val, mx)
-                if inc and inc > 0:
-                    base = mn if mn is not None else 0.0
-                    steps = math.floor((val - base) / inc + 1e-9)
-                    val = base + steps * inc
-                self._get_node("Gain").SetValue(val)
-                print(f"[Worker] set Digital Gain -> {val}")
-            except Exception as e:
-                self.error.emit(f"Set Digital Gain failed: {e}")
+            _set_gain("DigitalAll", float(d["digital"]))
 
         if paused and while_running:
             self._force_mono_format()
-            # No need to rebuild pool for gains, but some drivers like a re-queue
             if self._announce_and_queue(desired_fps=None):
                 print("[Worker] buffer pool rebuilt for gains")
             _resume()
 
-        # publish
         self.gains.emit(self._read_gains())
 
-    # ---------- slots (run in worker thread) ----------
+    # ---------- public slots (run in worker thread) ----------
     @Slot()
     def start(self) -> None:
         if self._closed or self._run.is_set():
@@ -665,8 +590,7 @@ class _StreamWorker(QObject):
                 self.error.emit("Start failed: buffer pool not ready")
                 return
             try:
-                n = self._nm.FindNode("TLParamsLocked")
-                n and n.SetValue(1)
+                n = self._nm.FindNode("TLParamsLocked"); n and n.SetValue(1)
             except Exception:
                 pass
             self._ds.StartAcquisition()
@@ -676,109 +600,113 @@ class _StreamWorker(QObject):
             print("[Worker] started acquisition")
 
             while self._run.is_set():
-                # ROI first (affects payload)
+                # apply any pending mailbox updates (one per loop for fairness)
                 pending_roi = self._pop_pending_roi()
                 if pending_roi is not None:
-                    self._apply_roi_payload(pending_roi, while_running=True)
+                    if pending_roi.get("__full__"):
+                        self._apply_full_sensor(while_running=True)
+                    else:
+                        self._apply_roi_payload(pending_roi, while_running=True)
                     continue
-                # Timing next
                 with self._tim_lock:
-                    t = self._pending_timing
-                    self._pending_timing = None
+                    t = self._pending_timing; self._pending_timing = None
                 if t is not None:
                     self._apply_timing_payload(t, while_running=True)
                     continue
-                # Gains next
                 with self._gain_lock:
-                    g = self._pending_gains
-                    self._pending_gains = None
+                    g = self._pending_gains; self._pending_gains = None
                 if g is not None:
                     self._apply_gains_payload(g, while_running=True)
                     continue
 
+                # wait for frame
                 buf = None
                 try:
-                    buf = self._ds.WaitForFinishedBuffer(10)
+                    buf = self._ds.WaitForFinishedBuffer(10)  # ms
                 except Exception:
                     continue
+
                 try:
                     img = ipl_ext.BufferToImage(buf)
-                    if hasattr(img, "get_numpy_1D"):
-                        import numpy as _np
-                        w, h = self._img_dims(img)
-                        flat = img.get_numpy_1D()
-                        bufarr = _np.asarray(flat)
-                        if bufarr.ndim != 1:
-                            bufarr = bufarr.reshape(-1)
-                        expected = w * h
-                        if bufarr.size == 2 * expected:
-                            if not bufarr.flags.c_contiguous:
-                                bufarr = _np.ascontiguousarray(bufarr)
-                            arr = bufarr.view('<u2').reshape(h, w).copy()
-                        else:
-                            arr = bufarr.reshape(h, w).copy()
-                    else:
+                    if not hasattr(img, "get_numpy_1D"):
                         raise RuntimeError("IDS IPL image missing numpy accessor")
-                    self.frame.emit(arr)
+                    w, h = self._img_dims(img)
+                    flat = np.asarray(img.get_numpy_1D())
+                    if flat.ndim != 1:
+                        flat = flat.reshape(-1)
+
+                    expected = w * h
+                    # If buffer is bytes (2*expected), re-interpret little-endian to uint16
+                    if flat.size == 2 * expected and flat.dtype == np.uint8:
+                        if not flat.flags.c_contiguous:
+                            flat = np.ascontiguousarray(flat)
+                        arr = flat.view("<u2").reshape(h, w).copy()
+                    else:
+                        arr = flat.reshape(h, w).copy()
+
+                    # Standardize to uint16, scale 8→12bit if needed
+                    if arr.dtype == np.uint8:
+                        arr = (arr.astype(np.uint16) << 4)
+                    elif arr.dtype != np.uint16:
+                        arr = arr.astype(np.uint16, copy=False)
+
+                    self.frame.emit(arr)  # 0..4095 expected
                 except Exception as e:
                     self.error.emit(f"Convert failed: {e}")
                 finally:
                     if buf is not None:
-                        try:
-                            self._ds.QueueBuffer(buf)
-                        except Exception:
-                            pass
+                        try: self._ds.QueueBuffer(buf)
+                        except Exception: pass
 
-            # finalize stop
+            # graceful stop
             print("[Worker] finalize stop begin")
-            try:
-                self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception:
-                pass
-            try:
-                self._ds.StopAcquisition()
-            except Exception:
-                pass
+            try: self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception: pass
+            try: self._ds.StopAcquisition()
+            except Exception: pass
             self._clear_pool()
             try:
-                n = self._nm.FindNode("TLParamsLocked")
-                n and n.SetValue(0)
+                n = self._nm.FindNode("TLParamsLocked"); n and n.SetValue(0)
             except Exception:
                 pass
             print("[Worker] finalize stop done")
             self.stopped.emit()
         except Exception as e:
             self.error.emit(f"Start failed: {e}")
-            try:
-                print("[Worker] start exception:", e)
-            except Exception:
-                pass
+            print("[Worker] start exception:", e)
 
     @Slot()
     def set_stop_flag(self) -> None:
-        print("[Worker] set_stop_flag (DirectConnection) — clearing run flag")
+        print("[Worker] set_stop_flag — clearing run flag")
         self._run.clear()
 
     @Slot()
     def request_stop(self) -> None:
-        print("[Worker] request_stop (Queued) — clearing run flag and trying CancelWait")
+        print("[Worker] request_stop — trying CancelWait")
         self._run.clear()
         try:
             cancel = getattr(self._ds, "CancelWait", None)
-            if callable(cancel):
-                cancel()
+            if callable(cancel): cancel()
         except Exception:
             pass
+
+    @Slot()
+    def process_pending_roi(self) -> None:
+        d = self._pop_pending_roi()
+        if d is not None:
+            if d.get("__full__"):
+                self._apply_full_sensor(while_running=False)
+            else:
+                self._apply_roi_payload(d, while_running=False)
 
     # ---- ROI API ----
     @Slot()
     def query_roi(self) -> None:
-        print("[Worker] query_roi requested")
         names = ("Width", "Height", "OffsetX", "OffsetY")
         out: Dict[str, Optional[float]] = {}
         for n in names:
             out[n] = self._node_value(n)
-        print(f"[Worker] query_roi -> {out}")
+        print(f"[Worker] ROI snapshot -> {out}")
         self.roi.emit(out)
 
     @Slot(object)
@@ -788,12 +716,6 @@ class _StreamWorker(QObject):
             return
         with self._roi_lock:
             self._pending_roi = roi
-
-    @Slot()
-    def process_pending_roi(self) -> None:
-        d = self._pop_pending_roi()
-        if d is not None:
-            self._apply_roi_payload(d, while_running=False)
 
     # ---- Timing API ----
     @Slot()
@@ -847,37 +769,37 @@ class _StreamWorker(QObject):
             return
         print("[Worker] close requested")
         self._run.clear()
-        try:
-            self._nm.FindNode("AcquisitionStop").Execute()
-        except Exception:
-            pass
-        try:
-            self._ds.StopAcquisition()
-        except Exception:
-            pass
+        try: self._nm.FindNode("AcquisitionStop").Execute()
+        except Exception: pass
+        try: self._ds.StopAcquisition()
+        except Exception: pass
         self._clear_pool()
         self._closed = True
         print("[Worker] closed")
         self.closed.emit()
 
 
+# ==================================================================
+# GUI-thread facade: IDSCamera
+# ==================================================================
 class IDSCamera(QObject):
-    """GUI-thread facade. All heavy lifting is delegated to _StreamWorker."""
+    """GUI-thread facade. All heavy lifting lives in _StreamWorker (QThread)."""
 
     opened = Signal(str)
     started = Signal()
     stopped = Signal()
     closed = Signal()
-    frame = Signal(object)
+    frame = Signal(object)   # uint16 image (12-bit data scaled to 0..4095)
     error = Signal(str)
     roi = Signal(dict)
     timing = Signal(dict)
     gains = Signal(dict)
 
-    # Direct cross-thread mailboxes
+    # Mailbox bridges (GUI → worker)
     send_roi = Signal(object)
     send_timing = Signal(object)
     send_gains = Signal(object)
+    send_full = Signal() 
 
     def __init__(self) -> None:
         super().__init__()
@@ -890,18 +812,26 @@ class IDSCamera(QObject):
         self._thread: Optional[QThread] = None
         self._last_roi: dict = {}
         self._zoom_prev_roi: Optional[Tuple[int, int, int, int]] = None  # (W,H,X,Y)
+
         self.roi.connect(self._remember_roi)
 
     def _on_started(self) -> None:
-        print("[UI] started() signal")
-        self._st.acquiring = True
+        """Worker says acquisition started; update state and bubble the signal up."""
+        try:
+            self._st.acquiring = True
+        except Exception:
+            pass
         self.started.emit()
 
     def _on_stopped(self) -> None:
-        print("[UI] stopped() signal")
-        self._st.acquiring = False
+        """Worker says acquisition stopped; update state and bubble the signal up."""
+        try:
+            self._st.acquiring = False
+        except Exception:
+            pass
         self.stopped.emit()
 
+    # ---------- facade lifecycle ----------
     @Slot()
     def open(self) -> None:
         print("[UI] open() called")
@@ -939,27 +869,35 @@ class IDSCamera(QObject):
                 return
             self._datastream = streams[0].OpenDataStream()
 
+            # worker thread
             self._thread = QThread(self)
             self._worker = _StreamWorker(self._node_map, self._datastream)
             self._worker.moveToThread(self._thread)
-            # bridges
-            self._worker.started.connect(self._on_started)
-            self._worker.stopped.connect(self._on_stopped)
-            self._worker.closed.connect(self.closed)
-            self._worker.frame.connect(self.frame)
-            self._worker.error.connect(self.error)
-            self._worker.roi.connect(self.roi)
-            self._worker.timing.connect(self.timing)
-            self._worker.gains.connect(self.gains)
+
+            # bridges: worker → facade
+            self._worker.started.connect(self._on_started, Qt.QueuedConnection)
+            self._worker.stopped.connect(self._on_stopped, Qt.QueuedConnection)
+            self._worker.closed.connect(self.closed, Qt.QueuedConnection)
+
+            self._worker.frame.connect(self.frame, Qt.QueuedConnection)
+            self._worker.error.connect(self.error, Qt.QueuedConnection)
+            self._worker.roi.connect(self.roi, Qt.QueuedConnection)
+            self._worker.timing.connect(self.timing, Qt.QueuedConnection)
+            self._worker.gains.connect(self.gains, Qt.QueuedConnection)
+
+            # mailboxes
             self.send_roi.connect(self._worker.enqueue_roi, Qt.DirectConnection)
             self.send_timing.connect(self._worker.enqueue_timing, Qt.DirectConnection)
             self.send_gains.connect(self._worker.enqueue_gains, Qt.DirectConnection)
+            self.send_full.connect(self._worker.enqueue_full_sensor, Qt.DirectConnection)
+
             self._thread.start()
 
             self._st.open = True
             name = chosen.DisplayName() if hasattr(chosen, "DisplayName") else "IDS camera"
             print("[UI] opened")
             self.opened.emit(str(name))
+
             # initial snapshots
             QMetaObject.invokeMethod(self._worker, "query_roi", Qt.QueuedConnection)
             QMetaObject.invokeMethod(self._worker, "query_timing", Qt.QueuedConnection)
@@ -985,16 +923,29 @@ class IDSCamera(QObject):
     def stop(self) -> None:
         print(f"[UI] stop() called; acquiring={self._st.acquiring}")
         if not self._worker:
-            print("[UI] stop ignored: no worker")
-            return
+            print("[UI] stop ignored: no worker"); return
+        # Clear the run flag immediately so the worker loop exits
         QMetaObject.invokeMethod(self._worker, "set_stop_flag", Qt.DirectConnection)
+        # Also nudge any blocking wait
         QMetaObject.invokeMethod(self._worker, "request_stop", Qt.QueuedConnection)
 
     @Slot()
+    def close(self) -> None:
+        if not self._st.open:
+            return
+        # Stop first if still acquiring
+        if self._st.acquiring and self._worker:
+            QMetaObject.invokeMethod(self._worker, "set_stop_flag", Qt.QueuedConnection)
+            QMetaObject.invokeMethod(self._worker, "request_stop", Qt.QueuedConnection)
+        if self._worker:
+            QMetaObject.invokeMethod(self._worker, "close", Qt.BlockingQueuedConnection)
+        self._cleanup_all()
+
+    # ---------- facade controls ----------
+    @Slot()
     def set_roi(self, w: float, h: float, x: float, y: float) -> None:
         if not self._worker:
-            print("[UI] set_roi ignored: no worker")
-            return
+            print("[UI] set_roi ignored: no worker"); return
         print(f"[UI] set_roi(w={w}, h={h}, x={x}, y={y}); acquiring={self._st.acquiring}")
         payload = {"Width": w, "Height": h, "OffsetX": x, "OffsetY": y}
         self.send_roi.emit(payload)
@@ -1004,22 +955,26 @@ class IDSCamera(QObject):
             QMetaObject.invokeMethod(self._worker, "query_timing", Qt.QueuedConnection)
 
     @Slot()
+    def full_sensor(self) -> None:
+        if not self._worker:
+            print("[UI] full_sensor ignored: no worker"); return
+        self.send_full.emit()
+        if not self._st.acquiring:
+            # process immediately when idle
+            QMetaObject.invokeMethod(self._worker, "process_pending_roi", Qt.QueuedConnection)
+
+    @Slot()
     def set_timing(self, fps: Optional[float], exposure_ms: Optional[float]) -> None:
         if not self._worker:
-            print("[UI] set_timing ignored: no worker")
-            return
+            print("[UI] set_timing ignored: no worker"); return
         print(f"[UI] set_timing(fps={fps}, exposure_ms={exposure_ms}); acquiring={self._st.acquiring}")
         payload: Dict[str, float] = {}
         if fps is not None:
-            try:
-                payload["fps"] = float(fps)
-            except Exception:
-                pass
+            try: payload["fps"] = float(fps)
+            except Exception: pass
         if exposure_ms is not None:
-            try:
-                payload["exposure_ms"] = float(exposure_ms)
-            except Exception:
-                pass
+            try: payload["exposure_ms"] = float(exposure_ms)
+            except Exception: pass
         self.send_timing.emit(payload)
         if not self._st.acquiring:
             QMetaObject.invokeMethod(self._worker, "process_pending_timing", Qt.QueuedConnection)
@@ -1027,66 +982,41 @@ class IDSCamera(QObject):
     @Slot()
     def set_gains(self, analog: Optional[float], digital: Optional[float]) -> None:
         if not self._worker:
-            print("[UI] set_gains ignored: no worker")
-            return
+            print("[UI] set_gains ignored: no worker"); return
         print(f"[UI] set_gains(analog={analog}, digital={digital}); acquiring={self._st.acquiring}")
         payload: Dict[str, Optional[float]] = {}
-        if analog is not None:
-            payload["analog"] = float(analog)
-        if digital is not None:
-            payload["digital"] = float(digital)
+        if analog is not None:  payload["analog"] = float(analog)
+        if digital is not None: payload["digital"] = float(digital)
         self.send_gains.emit(payload)
         if not self._st.acquiring:
             QMetaObject.invokeMethod(self._worker, "process_pending_gains", Qt.QueuedConnection)
 
     @Slot()
     def refresh_timing(self) -> None:
-        if not self._worker:
-            print("[UI] refresh_timing ignored: no worker")
-            return
+        if not self._worker: return
         QMetaObject.invokeMethod(self._worker, "query_timing", Qt.QueuedConnection)
 
     @Slot()
     def refresh_gains(self) -> None:
-        if not self._worker:
-            print("[UI] refresh_gains ignored: no worker")
-            return
+        if not self._worker: return
         QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
 
-    @Slot()
-    def close(self) -> None:
-        print(f"[UI] close() called; acquiring={self._st.acquiring}")
-        if not self._st.open:
-            print("[UI] close ignored: not open")
-            return
-        if self._st.acquiring:
-            self.error.emit("Stop before Close.")
-            print("[UI] close refused: acquiring")
-            return
-        if self._worker:
-            QMetaObject.invokeMethod(self._worker, "close", Qt.BlockingQueuedConnection)
-        self._cleanup_all()
-
+    # ---------- zoom helpers ----------
     @Slot(dict)
     def _remember_roi(self, d: dict) -> None:
-        """Keep a snapshot of the most recent ROI (as applied by the worker)."""
         try:
             out = {}
             for k in ("Width", "Height", "OffsetX", "OffsetY"):
                 v = d.get(k)
                 if v is not None:
                     out[k] = int(round(float(v)))
-            if out:
-                self._last_roi = out
+            if out: self._last_roi = out
         except Exception:
             pass
 
     @Slot(object)
     def set_zoom_roi(self, xywh: object) -> None:
-        """
-        Request a small ROI around a spot: (x, y, w, h).
-        On the first call, remember the current ROI so we can restore on close.
-        """
+        """Request a small ROI around a spot: (x, y, w, h)."""
         if not isinstance(xywh, (tuple, list)) or len(xywh) != 4:
             print("[UI] set_zoom_roi ignored (bad tuple):", xywh); return
         try:
@@ -1099,11 +1029,9 @@ class IDSCamera(QObject):
             if all(k in lr for k in ("Width", "Height", "OffsetX", "OffsetY")):
                 self._zoom_prev_roi = (lr["Width"], lr["Height"], lr["OffsetX"], lr["OffsetY"])
             else:
-                # Ask worker to emit a fresh ROI snapshot for next time
                 if self._worker:
                     QMetaObject.invokeMethod(self._worker, "query_roi", Qt.QueuedConnection)
 
-        # Apply (worker will snap to legal increments)
         self.set_roi(w, h, x, y)
 
     @Slot()
@@ -1115,12 +1043,12 @@ class IDSCamera(QObject):
         self._zoom_prev_roi = None
         self.set_roi(w, h, x, y)
 
+    # ---------- cleanup ----------
     def _cleanup_all(self) -> None:
         try:
             if self._thread:
                 self._thread.quit()
-                if not self._thread.wait(3000):  # was 1000
-                    # last resort on stubborn drivers
+                if not self._thread.wait(3000):
                     try:
                         self._thread.terminate()
                         self._thread.wait(1000)

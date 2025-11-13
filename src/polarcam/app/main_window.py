@@ -65,6 +65,9 @@ class MainWindow(QMainWindow):
             cam.timing.connect(self._on_timing)
             cam.roi.connect(self._on_roi)
             cam.gains.connect(self._on_gains)
+            cam.desaturated.connect(self._on_desaturated)
+            cam.auto_desat_started.connect(self._on_desat_started)
+            cam.auto_desat_finished.connect(self._on_desat_finished)
         else:
             self.status.showMessage("No camera backend attached.", 4000)
 
@@ -76,8 +79,12 @@ class MainWindow(QMainWindow):
         self.btn_apply_roi.clicked.connect(self._apply_roi)
         self.btn_full_roi.clicked.connect(self._full_roi_clicked)
         self.btn_apply_tim.clicked.connect(self._apply_timing)
+        self.btn_desat.clicked.connect(self._desaturate_clicked)
         self.btn_apply_gains.clicked.connect(self._apply_gains)
         self.btn_refresh_gains.clicked.connect(self._refresh_gains)
+        self.btn_varmap.clicked.connect(self._open_varmap)
+
+        self._varmap = None
 
         # small helper for histogram rate-limiting
         self._hist_t_last = 0.0
@@ -94,9 +101,10 @@ class MainWindow(QMainWindow):
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Stop")
         self.btn_close = QPushButton("Close")
+        self.btn_varmap = QPushButton("Variance…")
 
         self._toolbar = QHBoxLayout()
-        for b in (self.btn_open, self.btn_start, self.btn_stop, self.btn_close):
+        for b in (self.btn_open, self.btn_start, self.btn_stop, self.btn_close, self.btn_varmap):
             self._toolbar.addWidget(b)
         self._toolbar.addStretch(1)
 
@@ -122,6 +130,7 @@ class MainWindow(QMainWindow):
         self.ed_fps.setValidator(fpsv)
         self.ed_exp.setValidator(expv)
         self.btn_apply_tim = QPushButton("Apply Timing")
+        self.btn_desat = QPushButton("Desaturate")
 
         # Gains form
         self.ed_gain_ana = QLineEdit("")  # blank => unchanged
@@ -151,7 +160,11 @@ class MainWindow(QMainWindow):
         self._form.addRow(rw)
         self._form.addRow("FPS", self.ed_fps)
         self._form.addRow("Exposure (ms)", self.ed_exp)
-        self._form.addRow(self.btn_apply_tim)
+        rowt = QHBoxLayout()
+        rowt.addWidget(self.btn_apply_tim)
+        rowt.addWidget(self.btn_desat)
+        wt = QWidget(); wt.setLayout(rowt)
+        self._form.addRow(wt)
 
         # gains rows
         self._form.addRow("Analog gain", self.ed_gain_ana)
@@ -368,6 +381,49 @@ class MainWindow(QMainWindow):
         elif hasattr(self.ctrl, "cam") and hasattr(self.ctrl.cam, "refresh_gains"):
             self.ctrl.cam.refresh_gains()
             self.status.showMessage("Refreshing gains…", 800)
+
+    def _desaturate_clicked(self) -> None:
+        # Only really useful while streaming; still harmless if not
+        if hasattr(self.ctrl, "desaturate"):
+            self.status.showMessage("Auto-desaturating…", 2000)
+            self.ctrl.desaturate(0.85, 5)
+
+    def _on_desaturated(self, d: dict) -> None:
+        it = int(d.get("iterations", 0))
+        mx = int(d.get("final_max", -1))
+        ok = bool(d.get("success", False))
+        exp_us = d.get("exposure_us", None)
+        tgt = int(d.get("target", 0))
+        if ok:
+            self.status.showMessage(f"Desaturate done: iters={it}, max={mx}, target={tgt}, exposure={exp_us:.1f} µs", 3000)
+        else:
+            QMessageBox.warning(
+                self, "Desaturate",
+                f"Couldn’t reach target after {max(it, 5)} tries.\n"
+                f"Final max={mx}, target={tgt}, exposure={exp_us:.1f} µs"
+                if exp_us is not None else
+                f"Couldn’t reach target after {max(it, 5)} tries.\nFinal max={mx}, target={tgt}"
+            )
+
+    def _on_desat_started(self) -> None:
+        # defensive: button may not exist in some layouts
+        if hasattr(self, "btn_desat"):
+            self.btn_desat.setEnabled(False)
+        self.status.showMessage("Auto-desaturating…", 2000)
+
+    def _on_desat_finished(self) -> None:
+        if hasattr(self, "btn_desat"):
+            self.btn_desat.setEnabled(True)
+        self.status.showMessage("Auto-desaturate complete.", 1500)
+
+    def _open_varmap(self) -> None:
+        if self._varmap is None or not self._varmap.isVisible():
+            from polarcam.app.varmap_dialog import VarMapDialog
+            self._varmap = VarMapDialog(self.ctrl, self)
+            self._varmap.show()
+        else:
+            self._varmap.raise_()
+            self._varmap.activateWindow()
 
     # ---------- LUT plumbing ----------
     def _on_tone_params(self, floor: int, cap: int, gamma: float) -> None:

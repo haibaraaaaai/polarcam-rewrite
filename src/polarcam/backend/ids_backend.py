@@ -50,6 +50,9 @@ class _StreamWorker(QObject):
     roi = Signal(dict)       # {Width, Height, OffsetX, OffsetY}
     timing = Signal(dict)    # {fps, resulting_fps, exposure_us, ...}
     gains = Signal(dict)     # {'analog':{val,min,max,inc}, 'digital':{...}}
+    desaturated = Signal(dict)
+    auto_desat_started = Signal()
+    auto_desat_finished = Signal()
 
     def __init__(self, node_map, datastream) -> None:
         super().__init__()
@@ -58,6 +61,7 @@ class _StreamWorker(QObject):
         self._announced: List[object] = []
         self._run = Event()
         self._closed = False
+        self._desat_busy = False
 
         # Mailboxes (set from GUI thread; read+clear in worker loop)
         self._roi_lock = Lock()
@@ -68,6 +72,9 @@ class _StreamWorker(QObject):
 
         self._gain_lock = Lock()
         self._pending_gains: Optional[Dict[str, Any]] = None
+
+        self._desat_lock = Lock()
+        self._pending_desat: Optional[Tuple[float, int]] = None  # (target_frac, max_iters)
 
     # ---------- helpers: generic node access ----------
     def _get_node(self, name: str):
@@ -600,6 +607,13 @@ class _StreamWorker(QObject):
             print("[Worker] started acquisition")
 
             while self._run.is_set():
+                # auto-desaturate request
+                with self._desat_lock:
+                    p = self._pending_desat
+                    self._pending_desat = None
+                if p is not None:
+                    self._run_auto_desat(*p)
+                    continue
                 # apply any pending mailbox updates (one per loop for fairness)
                 pending_roi = self._pop_pending_roi()
                 if pending_roi is not None:
@@ -769,6 +783,140 @@ class _StreamWorker(QObject):
                 return
             self._apply_gains_payload(g, while_running=False)
 
+    @Slot(float, int)
+    def enqueue_auto_desat(self, target_frac: float, max_iters: int) -> None:
+        print(f"[Worker] enqueue_auto_desat <- target={target_frac}, max_iters={max_iters}")
+        if self._desat_busy:
+            print("[AutoDesat] already running; ignoring request")
+            return
+        self._desat_busy = True
+        self.auto_desat_started.emit()
+        # Run immediately inside the worker thread (we’re already in it)
+        try:
+            self._run_auto_desat(target_frac, max_iters)
+        finally:
+            self._desat_busy = False
+            self.auto_desat_finished.emit()
+
+    def _sample_stats(self, timeout_ms: int = 150) -> Optional[tuple[int, int]]:
+        """Return (pMax, p99_9) of a fresh frame, or None on timeout."""
+        buf = None
+        try:
+            buf = self._ds.WaitForFinishedBuffer(timeout_ms)
+        except Exception:
+            return None
+        try:
+            img = ipl_ext.BufferToImage(buf)
+            w, h = self._img_dims(img)
+            flat = np.asarray(img.get_numpy_1D())
+            if flat.ndim != 1:
+                flat = flat.reshape(-1)
+            expected = w * h
+            if flat.size == 2 * expected and flat.dtype == np.uint8:
+                if not flat.flags.c_contiguous:
+                    flat = np.ascontiguousarray(flat)
+                arr = flat.view("<u2").reshape(h, w)
+            else:
+                arr = flat.reshape(h, w)
+            if arr.dtype != np.uint16:
+                arr = arr.astype(np.uint16, copy=False)
+            v = arr.ravel()
+            pmax = int(v.max())
+            # robust percentile (avoid hot single pixels)
+            p = np.partition(v, int(0.999 * (v.size - 1)))[int(0.999 * (v.size - 1))]
+            p999 = int(p)
+            return pmax, p999
+        finally:
+            if buf is not None:
+                try: self._ds.QueueBuffer(buf)
+                except Exception: pass
+
+    def _pause_stream(self):
+        try: self._nm.FindNode("AcquisitionStop").Execute()
+        except Exception: pass
+        try: self._ds.StopAcquisition()
+        except Exception: pass
+
+    def _resume_stream(self):
+        try:
+            self._ds.StartAcquisition()
+            self._nm.FindNode("AcquisitionStart").Execute()
+        except Exception as e:
+            self.error.emit(f"AutoDesat resume failed: {e}")
+
+    def _run_auto_desat(self, target_frac: float, max_iters: int) -> None:
+        target_frac = float(max(0.05, min(target_frac, 0.999)))
+        target_dn = int(round(4095.0 * target_frac))
+        iters = max(1, int(max_iters))
+
+        print(f"[AutoDesat] begin: target={target_dn} (~{target_frac*100:.1f}% FS) max_iters={iters}")
+
+        for i in range(1, iters + 1):
+            stats = self._sample_stats(timeout_ms=200)
+            if stats is None:
+                print(f"[AutoDesat] iter {i}/{iters}: no frame (timeout); retrying…")
+                continue
+            pmax, p999 = stats
+            peak_for_ctrl = p999 if pmax > target_dn * 1.30 else pmax  # robust until near target
+            cur_exp = float(self._node_value("ExposureTime") or 10000.0)
+            print(f"[AutoDesat] iter {i}/{iters}: pMax={pmax} p99.9={p999} target={target_dn} exp={cur_exp:.1f}us")
+
+            if peak_for_ctrl <= target_dn:
+                print(f"[AutoDesat] done in {i} step(s): metric={peak_for_ctrl} ≤ target={target_dn}")
+                break
+
+            # Compute new exposure from the chosen metric
+            factor = max(0.05, min(1.0, (target_dn / max(1.0, float(peak_for_ctrl))) * 0.92))
+            new_exp = self._snap("ExposureTime", cur_exp * factor)
+
+            # Hard apply with pause → set → rebuild → resume to ensure effect on next frame
+            self._pause_stream()
+            try:
+                tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
+            except Exception:
+                pass
+            try:
+                self._get_node("ExposureTime").SetValue(new_exp)
+                print(f"[AutoDesat] iter {i}: set Exposure -> {new_exp:.1f} us (factor={factor:.3f})")
+            except Exception as e:
+                self.error.emit(f"AutoDesat: set Exposure failed: {e}")
+            finally:
+                try:
+                    tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(1)
+                except Exception:
+                    pass
+
+            # Rebuild buffers to kill any in-flight old frames
+            self._announce_and_queue(desired_fps=None)
+            self._resume_stream()
+
+            # small settle (~3 frames)
+            rf = self._node_value("ResultingFrameRate") or self._node_value("AcquisitionFrameRate") or 30.0
+            settle = max(0.06, 3.0 / float(rf))
+            sleep(settle)
+
+        else:
+            # final verification
+            stats = self._sample_stats(timeout_ms=200)
+            final = stats[0] if stats else None
+            if (final is not None) and (final <= target_dn):
+                print(f"[AutoDesat] achieved after settle: peak={final} ≤ target={target_dn}")
+            else:
+                msg = f"AutoDesat: max {iters} step(s) reached; peak still above target."
+                print("[AutoDesat] " + msg)
+                self.error.emit(msg)
+
+        # keep GUI in sync
+        self.query_timing()
+
+    @Slot()
+    def process_pending_desat(self) -> None:
+        with self._desat_lock:
+            p = self._pending_desat
+            self._pending_desat = None
+        if p is not None:
+            self._run_auto_desat(*p)
+
     @Slot()
     def close(self) -> None:
         if self._closed:
@@ -800,12 +948,17 @@ class IDSCamera(QObject):
     roi = Signal(dict)
     timing = Signal(dict)
     gains = Signal(dict)
+    desaturated = Signal(dict)
+
+    auto_desat_started = Signal()
+    auto_desat_finished = Signal()
 
     # Mailbox bridges (GUI → worker)
     send_roi = Signal(object)
     send_timing = Signal(object)
     send_gains = Signal(object)
     send_full = Signal() 
+    send_desat = Signal(float, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -890,12 +1043,16 @@ class IDSCamera(QObject):
             self._worker.roi.connect(self.roi, Qt.QueuedConnection)
             self._worker.timing.connect(self.timing, Qt.QueuedConnection)
             self._worker.gains.connect(self.gains, Qt.QueuedConnection)
+            self._worker.desaturated.connect(self.desaturated, Qt.QueuedConnection)
+            self._worker.auto_desat_started.connect(self.auto_desat_started, Qt.QueuedConnection)
+            self._worker.auto_desat_finished.connect(self.auto_desat_finished, Qt.QueuedConnection)
 
             # mailboxes
             self.send_roi.connect(self._worker.enqueue_roi, Qt.DirectConnection)
             self.send_timing.connect(self._worker.enqueue_timing, Qt.DirectConnection)
             self.send_gains.connect(self._worker.enqueue_gains, Qt.DirectConnection)
             self.send_full.connect(self._worker.enqueue_full_sensor, Qt.DirectConnection)
+            self.send_desat.connect(self._worker.enqueue_auto_desat, Qt.DirectConnection)
 
             self._thread.start()
 
@@ -1012,6 +1169,17 @@ class IDSCamera(QObject):
         else:
             # safe when idle
             QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
+
+    @Slot(float, int)
+    def auto_desaturate(self, target_frac: float = 0.85, max_iters: int = 5) -> None:
+        print(f"[UI] auto_desaturate() called target={target_frac} iters={max_iters}")
+        if not self._worker:
+            return
+        # Mailbox push — Direct so it lands even while the worker’s loop is running
+        self.send_desat.emit(float(target_frac), int(max_iters))
+        # If idle, process immediately once
+        if not self._st.acquiring:
+            QMetaObject.invokeMethod(self._worker, "process_pending_desat", Qt.QueuedConnection)
 
     # ---------- zoom helpers ----------
     @Slot(dict)

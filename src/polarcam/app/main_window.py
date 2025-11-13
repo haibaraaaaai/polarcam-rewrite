@@ -85,6 +85,7 @@ class MainWindow(QMainWindow):
         self.btn_varmap.clicked.connect(self._open_varmap)
 
         self._varmap = None
+        self._last_pm = None  # type: Optional[QPixmap]
 
         # small helper for histogram rate-limiting
         self._hist_t_last = 0.0
@@ -219,7 +220,8 @@ class MainWindow(QMainWindow):
 
     def _on_closed(self) -> None:
         self.status.showMessage("Closed", 1500)
-        self.video.setPixmap(QPixmap())  # clear view
+        self.video.setPixmap(QPixmap())
+        self._last_pm = None
         self._set_buttons(open_enabled=True, start=False, stop=False, close=False)
 
     def _on_error(self, msg: str) -> None:
@@ -259,7 +261,8 @@ class MainWindow(QMainWindow):
                 a8 = np.ascontiguousarray(a8)
 
             qimg = QImage(a8.data, w, h, w, QImage.Format_Grayscale8)
-            self.video.setPixmap(QPixmap.fromImage(qimg.copy()))
+            self._last_pm = QPixmap.fromImage(qimg.copy())
+            self._refresh_video_view()
         except Exception as e:
             self.status.showMessage(f"Frame error: {e}", 2000)
 
@@ -417,13 +420,22 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Auto-desaturate complete.", 1500)
 
     def _open_varmap(self) -> None:
-        if self._varmap is None or not self._varmap.isVisible():
-            from polarcam.app.varmap_dialog import VarMapDialog
-            self._varmap = VarMapDialog(self.ctrl, self)
-            self._varmap.show()
-        else:
+        # If an existing dialog is alive, just bring it to front
+        if self._varmap_alive():
             self._varmap.raise_()
             self._varmap.activateWindow()
+            return
+
+        # Otherwise create a new one
+        from polarcam.app.varmap_dialog import VarMapDialog
+        dlg = VarMapDialog(self.ctrl, self)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        # When Qt deletes the C++ object, reset our Python ref to None
+        dlg.destroyed.connect(lambda _=None: setattr(self, "_varmap", None))
+
+        self._varmap = dlg
+        dlg.show()
 
     # ---------- LUT plumbing ----------
     def _on_tone_params(self, floor: int, cap: int, gamma: float) -> None:
@@ -440,6 +452,30 @@ class MainWindow(QMainWindow):
         t = np.clip(t, 0.0, 1.0)
         y = np.power(t, gamma) * 255.0
         return np.clip(np.rint(y), 0, 255).astype(np.uint8)
+
+    def _varmap_alive(self) -> bool:
+        vm = getattr(self, "_varmap", None)
+        if vm is None:
+            return False
+        try:
+            # this will raise RuntimeError if the C++ object was deleted
+            return vm.isVisible()
+        except RuntimeError:
+            self._varmap = None
+            return False
+        
+    def _refresh_video_view(self) -> None:
+        """Scale the last frame to the label size, keeping aspect ratio."""
+        pm = getattr(self, "_last_pm", None)
+        if pm is None:
+            return
+        self.video.setPixmap(
+            pm.scaled(self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._refresh_video_view()
 
     # ---------- cleanup ----------
     def safe_shutdown(self) -> None:

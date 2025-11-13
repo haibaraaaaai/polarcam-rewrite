@@ -1,18 +1,31 @@
 # src/polarcam/app/main_window.py
 from __future__ import annotations
 
-from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QLabel, QStatusBar,
-    QPushButton, QHBoxLayout, QVBoxLayout, QFormLayout,
-    QLineEdit, QMessageBox, QApplication
-)
-from PySide6.QtGui import QImage, QPixmap, QIntValidator, QDoubleValidator
-from PySide6.QtCore import Qt
+import time
+from typing import Optional
+
 import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPixmap, QIntValidator, QDoubleValidator
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QFormLayout,
+    QHBoxLayout,
+    QLineEdit,
+    QMessageBox,
+    QMainWindow,
+    QPushButton,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+from polarcam.app.lut_widget import HighlightLUTWidget
 
 
 class MainWindow(QMainWindow):
-    """Lean GUI: Open/Start/Stop/Close + ROI/Timing + Gains. Live video."""
+    """Lean GUI: Open/Start/Stop/Close + ROI/Timing + Gains + Highlight LUT. Live video."""
 
     def __init__(self, ctrl) -> None:
         super().__init__()
@@ -24,13 +37,20 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
 
+        # tone/LUT control
+        self._lut: Optional[np.ndarray] = None
+        self.tone = HighlightLUTWidget(self)
+        self.tone.paramsChanged.connect(self._on_tone_params)
+        # seed LUT from widget defaults
+        self._on_tone_params(*self.tone.params())
+
         # build UI
         self._build_video()
         self._build_toolbar()
         self._build_forms()
         self._assemble_layout()
 
-        # start with conservative button states
+        # starting button states
         self._set_buttons(open_enabled=True, start=False, stop=False, close=False)
 
         # wire controller/backend signals if present
@@ -59,6 +79,9 @@ class MainWindow(QMainWindow):
         self.btn_apply_gains.clicked.connect(self._apply_gains)
         self.btn_refresh_gains.clicked.connect(self._refresh_gains)
 
+        # small helper for histogram rate-limiting
+        self._hist_t_last = 0.0
+
     # ---------- builders ----------
     def _build_video(self) -> None:
         self.video = QLabel("No video")
@@ -67,9 +90,9 @@ class MainWindow(QMainWindow):
         self.video.setStyleSheet("background:#111; color:#777;")
 
     def _build_toolbar(self) -> None:
-        self.btn_open  = QPushButton("Open")
+        self.btn_open = QPushButton("Open")
         self.btn_start = QPushButton("Start")
-        self.btn_stop  = QPushButton("Stop")
+        self.btn_stop = QPushButton("Stop")
         self.btn_close = QPushButton("Close")
 
         self._toolbar = QHBoxLayout()
@@ -79,35 +102,39 @@ class MainWindow(QMainWindow):
 
     def _build_forms(self) -> None:
         # ROI form
-        self.ed_w = QLineEdit("2464"); self.ed_h = QLineEdit("2056")
-        self.ed_x = QLineEdit("0");    self.ed_y = QLineEdit("0")
+        self.ed_w = QLineEdit("2464")
+        self.ed_h = QLineEdit("2056")
+        self.ed_x = QLineEdit("0")
+        self.ed_y = QLineEdit("0")
         intv = QIntValidator(0, 1_000_000, self)
         for ed in (self.ed_w, self.ed_h, self.ed_x, self.ed_y):
             ed.setValidator(intv)
         self.btn_apply_roi = QPushButton("Apply ROI")
-        self.btn_full_roi  = QPushButton("Full sensor")
+        self.btn_full_roi = QPushButton("Full sensor")
 
         # Timing form
         self.ed_fps = QLineEdit("20.0")
         self.ed_exp = QLineEdit("50.0")
-        fpsv = QDoubleValidator(0.01, 1_000.0, 3, self); fpsv.setNotation(QDoubleValidator.StandardNotation)
-        expv = QDoubleValidator(0.01, 2_000.0, 3, self); expv.setNotation(QDoubleValidator.StandardNotation)
+        fpsv = QDoubleValidator(0.01, 1_000.0, 3, self)
+        fpsv.setNotation(QDoubleValidator.StandardNotation)
+        expv = QDoubleValidator(0.01, 2_000.0, 3, self)
+        expv.setNotation(QDoubleValidator.StandardNotation)
         self.ed_fps.setValidator(fpsv)
         self.ed_exp.setValidator(expv)
         self.btn_apply_tim = QPushButton("Apply Timing")
 
         # Gains form
-        self.ed_gain_ana = QLineEdit("")   # leave blank => unchanged
+        self.ed_gain_ana = QLineEdit("")  # blank => unchanged
         self.ed_gain_dig = QLineEdit("")
-        gval = QDoubleValidator(0.0, 1000.0, 3, self); gval.setNotation(QDoubleValidator.StandardNotation)
+        gval = QDoubleValidator(0.0, 1000.0, 3, self)
+        gval.setNotation(QDoubleValidator.StandardNotation)
         self.ed_gain_ana.setValidator(gval)
         self.ed_gain_dig.setValidator(gval)
         self.ed_gain_ana.setPlaceholderText("—")
         self.ed_gain_dig.setPlaceholderText("—")
         self.btn_apply_gains = QPushButton("Apply gains")
         self.btn_refresh_gains = QPushButton("Refresh gains")
-        # live range hints
-        self._lbl_gain_ana = QLabel("")  # will show "min…max (inc …)"
+        self._lbl_gain_ana = QLabel("")  # “min…max (inc …)”
         self._lbl_gain_dig = QLabel("")
 
         # master form layout
@@ -119,13 +146,14 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(self.btn_apply_roi)
         row.addWidget(self.btn_full_roi)
-        rw = QWidget(); rw.setLayout(row)
+        rw = QWidget()
+        rw.setLayout(row)
         self._form.addRow(rw)
         self._form.addRow("FPS", self.ed_fps)
         self._form.addRow("Exposure (ms)", self.ed_exp)
         self._form.addRow(self.btn_apply_tim)
 
-        # add gains rows
+        # gains rows
         self._form.addRow("Analog gain", self.ed_gain_ana)
         self._form.addRow("", self._lbl_gain_ana)
         self._form.addRow("Digital gain", self.ed_gain_dig)
@@ -133,21 +161,25 @@ class MainWindow(QMainWindow):
         rowg = QHBoxLayout()
         rowg.addWidget(self.btn_apply_gains)
         rowg.addWidget(self.btn_refresh_gains)
-        rg = QWidget(); rg.setLayout(rowg)
+        rg = QWidget()
+        rg.setLayout(rowg)
         self._form.addRow(rg)
 
     def _assemble_layout(self) -> None:
-        right = QWidget(); right.setLayout(self._form)
+        right = QWidget()
+        right.setLayout(self._form)
 
         leftcol = QVBoxLayout()
         leftcol.addLayout(self._toolbar)
         leftcol.addWidget(self.video, 1)
+        leftcol.addWidget(self.tone)
 
         root = QHBoxLayout()
         root.addLayout(leftcol, 2)
         root.addWidget(right, 1)
 
-        cw = QWidget(); cw.setLayout(root)
+        cw = QWidget()
+        cw.setLayout(root)
         self.setCentralWidget(cw)
 
     # ---------- button state helper ----------
@@ -182,19 +214,33 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Camera error", msg)
 
     def _on_frame(self, arr_obj: object) -> None:
-        """Assume uint16 0..4095; downscale to 8-bit for display."""
+        """Apply highlight-LUT if present; otherwise do rounded 12→8. Update LUT histogram ~2 Hz."""
         try:
-            a = np.asarray(arr_obj)
-            if a.ndim != 2:
+            a16 = np.asarray(arr_obj)
+            if a16.ndim != 2:
                 return
-            h, w = a.shape
+            h, w = a16.shape
 
-            if a.dtype == np.uint16:
-                a8 = (a >> 4).astype(np.uint8, copy=False)  # 12→8 bit
-            elif a.dtype == np.uint8:
-                a8 = a
+            # update histogram for LUT widget at ~2 Hz
+            if time.time() - self._hist_t_last > 0.5:
+                self._hist_t_last = time.time()
+                # 256 bins over 12-bit range: bucket by top 8 bits (>> 4)
+                vals = (a16.astype(np.uint16, copy=False) >> 4).ravel()
+                hist = np.bincount(vals, minlength=256)
+                if hist.size > 256:  # safety (shouldn't happen)
+                    hist = hist[:256]
+                self.tone.setHistogram256(hist)
+
+            # mapping
+            if self._lut is not None:
+                if a16.dtype != np.uint16:
+                    a16 = a16.astype(np.uint16, copy=False)
+                a8 = self._lut[a16]
             else:
-                a8 = np.clip(a.astype(np.float32), 0, 255).astype(np.uint8)
+                # rounded divide-by-16 (vs truncate)
+                if a16.dtype != np.uint16:
+                    a16 = a16.astype(np.uint16, copy=False)
+                a8 = ((a16 + 8) >> 4).astype(np.uint8, copy=False)
 
             if not a8.flags.c_contiguous:
                 a8 = np.ascontiguousarray(a8)
@@ -206,20 +252,30 @@ class MainWindow(QMainWindow):
 
     def _on_timing(self, d: dict) -> None:
         try:
-            fps = d.get("fps"); exp_us = d.get("exposure_us")
-            if fps is not None:   self.ed_fps.setText(f"{float(fps):.3f}")
-            if exp_us is not None:self.ed_exp.setText(f"{float(exp_us)/1000.0:.3f}")
+            fps = d.get("fps")
+            exp_us = d.get("exposure_us")
+            if fps is not None:
+                self.ed_fps.setText(f"{float(fps):.3f}")
+            if exp_us is not None:
+                self.ed_exp.setText(f"{float(exp_us) / 1000.0:.3f}")
             msg = []
-            if fps is not None:   msg.append(f"FPS={float(fps):.3f}")
-            if exp_us is not None:msg.append(f"EXP={float(exp_us)/1000.0:.3f} ms")
-            if msg: self.status.showMessage("Timing applied: " + "  ".join(msg), 2000)
+            if fps is not None:
+                msg.append(f"FPS={float(fps):.3f}")
+            if exp_us is not None:
+                msg.append(f"EXP={float(exp_us) / 1000.0:.3f} ms")
+            if msg:
+                self.status.showMessage("Timing applied: " + "  ".join(msg), 2000)
         except Exception:
             pass
 
     def _on_roi(self, d: dict) -> None:
         try:
-            mapping = [("Width", self.ed_w), ("Height", self.ed_h),
-                       ("OffsetX", self.ed_x), ("OffsetY", self.ed_y)]
+            mapping = [
+                ("Width", self.ed_w),
+                ("Height", self.ed_h),
+                ("OffsetX", self.ed_x),
+                ("OffsetY", self.ed_y),
+            ]
             for key, edit in mapping:
                 v = d.get(key)
                 if v is not None:
@@ -233,15 +289,15 @@ class MainWindow(QMainWindow):
             ana = g.get("analog", {}) or {}
             dig = g.get("digital", {}) or {}
 
-            # Update line-edits with the current value if present
             if ana.get("val") is not None:
                 self.ed_gain_ana.setText(f"{float(ana['val']):.3f}")
             if dig.get("val") is not None:
                 self.ed_gain_dig.setText(f"{float(dig['val']):.3f}")
 
-            # Show limits as hints
             def rng(dct: dict) -> str:
-                mn = dct.get("min"); mx = dct.get("max"); inc = dct.get("inc")
+                mn = dct.get("min")
+                mx = dct.get("max")
+                inc = dct.get("inc")
                 bits = []
                 if mn is not None and mx is not None:
                     bits.append(f"{float(mn):.3f} … {float(mx):.3f}")
@@ -256,20 +312,20 @@ class MainWindow(QMainWindow):
 
     # ---------- UI handlers (UI → controller) ----------
     def _open_clicked(self) -> None:
-        if not hasattr(self.ctrl, "open"): return
-        self.ctrl.open()
+        if hasattr(self.ctrl, "open"):
+            self.ctrl.open()
 
     def _start_clicked(self) -> None:
-        if not self.btn_start.isEnabled() or not hasattr(self.ctrl, "start"): return
-        self.ctrl.start()
+        if self.btn_start.isEnabled() and hasattr(self.ctrl, "start"):
+            self.ctrl.start()
 
     def _stop_clicked(self) -> None:
-        if not self.btn_stop.isEnabled() or not hasattr(self.ctrl, "stop"): return
-        self.ctrl.stop()
+        if self.btn_stop.isEnabled() and hasattr(self.ctrl, "stop"):
+            self.ctrl.stop()
 
     def _close_clicked(self) -> None:
-        if not self.btn_close.isEnabled() or not hasattr(self.ctrl, "close"): return
-        self.ctrl.close()
+        if self.btn_close.isEnabled() and hasattr(self.ctrl, "close"):
+            self.ctrl.close()
 
     def _apply_roi(self) -> None:
         try:
@@ -278,13 +334,15 @@ class MainWindow(QMainWindow):
             x = int(float(self.ed_x.text() or "0"))
             y = int(float(self.ed_y.text() or "0"))
         except Exception:
-            self.status.showMessage("ROI: invalid numbers", 2000); return
+            self.status.showMessage("ROI: invalid numbers", 2000)
+            return
 
         if w <= 0 or h <= 0:
             self.status.showMessage("ROI: width/height must be > 0. Use Full sensor if unsure.", 3000)
             return
 
-        self.ctrl.set_roi(w, h, x, y)
+        if hasattr(self.ctrl, "set_roi"):
+            self.ctrl.set_roi(w, h, x, y)
 
     def _full_roi_clicked(self) -> None:
         if hasattr(self.ctrl, "full_sensor"):
@@ -311,7 +369,23 @@ class MainWindow(QMainWindow):
             self.ctrl.cam.refresh_gains()
             self.status.showMessage("Refreshing gains…", 800)
 
-    # ---------- optional cleanup ----------
+    # ---------- LUT plumbing ----------
+    def _on_tone_params(self, floor: int, cap: int, gamma: float) -> None:
+        """Rebuild 4096→8 LUT whenever the widget changes."""
+        self._lut = self._build_lut(floor, cap, gamma)
+
+    @staticmethod
+    def _build_lut(floor: int, cap: int, gamma: float) -> np.ndarray:
+        cap = max(floor + 1, min(cap, 4095))
+        floor = max(0, min(floor, 4094))
+        gamma = max(0.05, min(gamma, 10.0))
+        x = np.arange(4096, dtype=np.float32)
+        t = (x - float(floor)) / float(cap - floor)
+        t = np.clip(t, 0.0, 1.0)
+        y = np.power(t, gamma) * 255.0
+        return np.clip(np.rint(y), 0, 255).astype(np.uint8)
+
+    # ---------- cleanup ----------
     def safe_shutdown(self) -> None:
         try:
             if hasattr(self.ctrl, "stop"):
@@ -325,7 +399,7 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, e) -> None:
-        # If we’re acquiring, the Stop button will be enabled — stop first.
+        # graceful stop→close when user hits the window X
         try:
             if self.btn_stop.isEnabled() and hasattr(self.ctrl, "stop"):
                 self.ctrl.stop()

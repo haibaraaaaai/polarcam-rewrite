@@ -616,7 +616,10 @@ class _StreamWorker(QObject):
                 with self._gain_lock:
                     g = self._pending_gains; self._pending_gains = None
                 if g is not None:
-                    self._apply_gains_payload(g, while_running=True)
+                    if g.get("__refresh__"):
+                        self.gains.emit(self._read_gains())
+                    else:
+                        self._apply_gains_payload(g, while_running=True)
                     continue
 
                 # wait for frame
@@ -761,6 +764,9 @@ class _StreamWorker(QObject):
             g = self._pending_gains
             self._pending_gains = None
         if g is not None:
+            if g.get("__refresh__"):
+                self.gains.emit(self._read_gains())
+                return
             self._apply_gains_payload(g, while_running=False)
 
     @Slot()
@@ -998,8 +1004,14 @@ class IDSCamera(QObject):
 
     @Slot()
     def refresh_gains(self) -> None:
-        if not self._worker: return
-        QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
+        if not self._worker:
+            print("[UI] refresh_gains ignored: no worker"); return
+        if self._st.acquiring:
+            # handled inside the worker loop immediately
+            self.send_gains.emit({"__refresh__": True})
+        else:
+            # safe when idle
+            QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
 
     # ---------- zoom helpers ----------
     @Slot(dict)

@@ -1,20 +1,18 @@
 # src/polarcam/app/main_window.py
 from __future__ import annotations
 
-from typing import Optional
-import numpy as np
-
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap, QIntValidator, QDoubleValidator
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QStatusBar,
     QPushButton, QHBoxLayout, QVBoxLayout, QFormLayout,
     QLineEdit, QMessageBox, QApplication
 )
+from PySide6.QtGui import QImage, QPixmap, QIntValidator, QDoubleValidator
+from PySide6.QtCore import Qt
+import numpy as np
 
 
 class MainWindow(QMainWindow):
-    """Lean GUI: Open/Start/Stop/Close + simple ROI/Timing apply. Live video."""
+    """Lean GUI: Open/Start/Stop/Close + ROI/Timing + Gains. Live video."""
 
     def __init__(self, ctrl) -> None:
         super().__init__()
@@ -46,8 +44,8 @@ class MainWindow(QMainWindow):
             cam.frame.connect(self._on_frame)
             cam.timing.connect(self._on_timing)
             cam.roi.connect(self._on_roi)
+            cam.gains.connect(self._on_gains)
         else:
-            # still allow UI launch without a backend for layout testing
             self.status.showMessage("No camera backend attached.", 4000)
 
         # wire buttons (UI → controller)
@@ -58,6 +56,8 @@ class MainWindow(QMainWindow):
         self.btn_apply_roi.clicked.connect(self._apply_roi)
         self.btn_full_roi.clicked.connect(self._full_roi_clicked)
         self.btn_apply_tim.clicked.connect(self._apply_timing)
+        self.btn_apply_gains.clicked.connect(self._apply_gains)
+        self.btn_refresh_gains.clicked.connect(self._refresh_gains)
 
     # ---------- builders ----------
     def _build_video(self) -> None:
@@ -96,6 +96,21 @@ class MainWindow(QMainWindow):
         self.ed_exp.setValidator(expv)
         self.btn_apply_tim = QPushButton("Apply Timing")
 
+        # Gains form
+        self.ed_gain_ana = QLineEdit("")   # leave blank => unchanged
+        self.ed_gain_dig = QLineEdit("")
+        gval = QDoubleValidator(0.0, 1000.0, 3, self); gval.setNotation(QDoubleValidator.StandardNotation)
+        self.ed_gain_ana.setValidator(gval)
+        self.ed_gain_dig.setValidator(gval)
+        self.ed_gain_ana.setPlaceholderText("—")
+        self.ed_gain_dig.setPlaceholderText("—")
+        self.btn_apply_gains = QPushButton("Apply gains")
+        self.btn_refresh_gains = QPushButton("Refresh gains")
+        # live range hints
+        self._lbl_gain_ana = QLabel("")  # will show "min…max (inc …)"
+        self._lbl_gain_dig = QLabel("")
+
+        # master form layout
         self._form = QFormLayout()
         self._form.addRow("Width", self.ed_w)
         self._form.addRow("Height", self.ed_h)
@@ -109,6 +124,17 @@ class MainWindow(QMainWindow):
         self._form.addRow("FPS", self.ed_fps)
         self._form.addRow("Exposure (ms)", self.ed_exp)
         self._form.addRow(self.btn_apply_tim)
+
+        # add gains rows
+        self._form.addRow("Analog gain", self.ed_gain_ana)
+        self._form.addRow("", self._lbl_gain_ana)
+        self._form.addRow("Digital gain", self.ed_gain_dig)
+        self._form.addRow("", self._lbl_gain_dig)
+        rowg = QHBoxLayout()
+        rowg.addWidget(self.btn_apply_gains)
+        rowg.addWidget(self.btn_refresh_gains)
+        rg = QWidget(); rg.setLayout(rowg)
+        self._form.addRow(rg)
 
     def _assemble_layout(self) -> None:
         right = QWidget(); right.setLayout(self._form)
@@ -135,6 +161,8 @@ class MainWindow(QMainWindow):
     def _on_open(self, name: str) -> None:
         self.status.showMessage(f"Opened: {name}", 1500)
         self._set_buttons(open_enabled=False, start=True, stop=False, close=True)
+        # pull a fresh gains snapshot on open
+        self._refresh_gains()
 
     def _on_started(self) -> None:
         self.status.showMessage("Started", 1500)
@@ -150,7 +178,6 @@ class MainWindow(QMainWindow):
         self._set_buttons(open_enabled=True, start=False, stop=False, close=False)
 
     def _on_error(self, msg: str) -> None:
-        # show and also toast for visibility
         self.status.showMessage(f"Error: {msg}", 5000)
         QMessageBox.warning(self, "Camera error", msg)
 
@@ -167,7 +194,6 @@ class MainWindow(QMainWindow):
             elif a.dtype == np.uint8:
                 a8 = a
             else:
-                # be forgiving in early testing
                 a8 = np.clip(a.astype(np.float32), 0, 255).astype(np.uint8)
 
             if not a8.flags.c_contiguous:
@@ -191,7 +217,6 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_roi(self, d: dict) -> None:
-        """Refresh ROI line-edits from backend snapshot (snapped values)."""
         try:
             mapping = [("Width", self.ed_w), ("Height", self.ed_h),
                        ("OffsetX", self.ed_x), ("OffsetY", self.ed_y)]
@@ -199,6 +224,33 @@ class MainWindow(QMainWindow):
                 v = d.get(key)
                 if v is not None:
                     edit.setText(str(int(round(float(v)))))
+        except Exception:
+            pass
+
+    def _on_gains(self, g: dict) -> None:
+        """Show current/limits for analog/digital gains."""
+        try:
+            ana = g.get("analog", {}) or {}
+            dig = g.get("digital", {}) or {}
+
+            # Update line-edits with the current value if present
+            if ana.get("val") is not None:
+                self.ed_gain_ana.setText(f"{float(ana['val']):.3f}")
+            if dig.get("val") is not None:
+                self.ed_gain_dig.setText(f"{float(dig['val']):.3f}")
+
+            # Show limits as hints
+            def rng(dct: dict) -> str:
+                mn = dct.get("min"); mx = dct.get("max"); inc = dct.get("inc")
+                bits = []
+                if mn is not None and mx is not None:
+                    bits.append(f"{float(mn):.3f} … {float(mx):.3f}")
+                if inc is not None:
+                    bits.append(f"inc {float(inc):.3f}")
+                return "  ".join(bits)
+
+            self._lbl_gain_ana.setText(rng(ana))
+            self._lbl_gain_dig.setText(rng(dig))
         except Exception:
             pass
 
@@ -235,13 +287,29 @@ class MainWindow(QMainWindow):
         self.ctrl.set_roi(w, h, x, y)
 
     def _full_roi_clicked(self) -> None:
-        self.ctrl.full_sensor()
+        if hasattr(self.ctrl, "full_sensor"):
+            self.ctrl.full_sensor()
 
     def _apply_timing(self) -> None:
         fps = float(self.ed_fps.text()) if self.ed_fps.hasAcceptableInput() else None
         exp = float(self.ed_exp.text()) if self.ed_exp.hasAcceptableInput() else None
         if hasattr(self.ctrl, "set_timing"):
             self.ctrl.set_timing(fps, exp)
+
+    def _apply_gains(self) -> None:
+        """Blank field = leave unchanged."""
+        ana = float(self.ed_gain_ana.text()) if self.ed_gain_ana.text().strip() else None
+        dig = float(self.ed_gain_dig.text()) if self.ed_gain_dig.text().strip() else None
+        if hasattr(self.ctrl, "set_gains"):
+            self.ctrl.set_gains(ana, dig)
+
+    def _refresh_gains(self) -> None:
+        if hasattr(self.ctrl, "refresh_gains"):
+            self.ctrl.refresh_gains()
+            self.status.showMessage("Refreshing gains…", 800)
+        elif hasattr(self.ctrl, "cam") and hasattr(self.ctrl.cam, "refresh_gains"):
+            self.ctrl.cam.refresh_gains()
+            self.status.showMessage("Refreshing gains…", 800)
 
     # ---------- optional cleanup ----------
     def safe_shutdown(self) -> None:
@@ -261,17 +329,12 @@ class MainWindow(QMainWindow):
         try:
             if self.btn_stop.isEnabled() and hasattr(self.ctrl, "stop"):
                 self.ctrl.stop()
-                # Let the worker unwind any WaitForFinishedBuffer()
                 QApplication.processEvents()
         except Exception:
             pass
-
-        # Then close the device/session.
         try:
             if hasattr(self.ctrl, "close"):
                 self.ctrl.close()
         except Exception:
             pass
-
-        # Let the normal close proceed.
         super().closeEvent(e)

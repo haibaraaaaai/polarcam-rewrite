@@ -35,6 +35,15 @@ class Controller(QObject):
     def refresh_gains(self) -> None:
         self.cam.refresh_gains()
 
+    def refresh_timing(self) -> None:
+        if hasattr(self.cam, "refresh_timing"):
+            self.cam.refresh_timing()
+
+    def refresh_roi(self) -> None:
+        # only if your facade exposes it; otherwise not needed
+        if hasattr(self.cam, "refresh_roi"):
+            self.cam.refresh_roi()
+
     def desaturate(self, target_frac: float = 0.85, max_iters: int = 5) -> None:
         cam = getattr(self, "cam", None)
         if cam is None:

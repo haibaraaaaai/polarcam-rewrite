@@ -1,106 +1,130 @@
-# src/polarcam/app/spot_viewer.py
 from __future__ import annotations
-
-from typing import List, Optional, Tuple
+import math, os
+from typing import List, Tuple, Optional, TYPE_CHECKING
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread
 from PySide6.QtWidgets import (
-    QDialog, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QWidget
+    QMainWindow, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QStatusBar
 )
+from PySide6.QtGui import QImage, QPixmap
 
-# spot tuple: (cx, cy, area_px, bbox_w, bbox_h)
+UI_CAP_MAX = 20.0  # preview cap (Hz)
+
+# ---- Type-only imports (for static checkers) ----
+if TYPE_CHECKING:
+    from .spot_recorder import SpotSignalRecorder, RecorderConfig, Spot  # type: ignore[misc]
+
+# ---- Runtime-optional imports under distinct aliases ----
+try:
+    from .spot_recorder import (
+        SpotSignalRecorder as SpotSignalRecorderRT,
+        RecorderConfig as RecorderConfigRT,
+        Spot as SpotRT,
+    )
+    _RECORDER_AVAILABLE = True
+except Exception:
+    SpotSignalRecorderRT = None  # type: ignore[assignment]
+    RecorderConfigRT = None      # type: ignore[assignment]
+    SpotRT = None                # type: ignore[assignment]
+    _RECORDER_AVAILABLE = False
 
 
-def _round_up(v: int, step: int) -> int:
-    if step <= 1:
-        return int(v)
-    return int(((v + step - 1) // step) * step)
-
-
-def _clamp(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, v))
-
-
-class SpotViewerDialog(QDialog):
+class SpotViewerWindow(QMainWindow):
     """
-    Automatically zooms to each selected spot:
-      • chooses a minimal *hardware* ROI around the spot (respecting camera snapping);
-      • then applies a *software* crop to hide any leftover padding.
-    Restores prior ROI + FPS on close. Exposure is left untouched.
+    Passive spot viewer (UI preview capped at ≤20 Hz) with optional background
+    recorder that runs the camera at max FPS. It tolerates being given either
+    a Controller (with .cam) or a camera-like object (with .frame/.roi/.timing).
     """
-
-    # Safe ROI constraints for IDS polarization camera (adjust if needed)
-    W_STEP = 16     # width increment (px)
-    H_STEP = 2      # height increment (px)
-    MIN_W = 64      # minimal ROI width (px)
-    MIN_H = 32      # minimal ROI height (px)
-
-    PAD_HW = 12     # px padding around the spot before snapping (hardware ROI)
-    PAD_SW = 8      # px padding shown around the spot in the software crop (display)
+    rec_progress = Signal(int)
 
     def __init__(
         self,
-        ctrl,
+        dev,  # Controller or camera-like object
         spots: List[Tuple[float, float, float, int, int]],
-        parent: Optional[QWidget] = None,
-        saved_roi: Tuple[int, int, int, int] | None = None,  # (w, h, x, y)
-        saved_fps: Optional[float] = None,
-    ) -> None:
-        super().__init__(parent, Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setWindowTitle("Spot viewer")
-        self.resize(950, 700)
+        parent: Optional[QMainWindow] = None,
+        index: int = 0,
+        **_ignored_kwargs,  # accepts saved_roi, saved_fps, etc., for back-compat
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Spot viewer — passive preview (≤20 Hz) + optional recorder")
+        self.resize(900, 650)
 
-        self.ctrl = ctrl
-        self.cam = getattr(ctrl, "cam", None)
-        self.spots = list(spots)
-        self.idx = 0
-
-        # Remember original state to restore
-        self._orig_roi = saved_roi or (0, 0, 0, 0)  # (w,h,x,y)
-        self._orig_fps = saved_fps
-
-        # Live camera reports
-        self._applied_roi = (0, 0, 0, 0)  # (x,y,w,h)
-        self._last_frame_shape = None     # (H, W)
+        self.dev = dev
+        self.spots = list(spots or [])
+        self.idx = int(max(0, min(index, max(0, len(self.spots) - 1))))
 
         # UI
+        self.status = QStatusBar(); self.setStatusBar(self.status)
         self.video = QLabel("Waiting for frames…")
         self.video.setAlignment(Qt.AlignCenter)
         self.video.setStyleSheet("background:#111; color:#777;")
-        self.video.setMinimumSize(640, 480)
 
-        self.btn_prev = QPushButton("◀ Prev")
-        self.btn_next = QPushButton("Next ▶")
-        self.btn_close = QPushButton("Close")
+        left = QVBoxLayout(); left.addWidget(self.video, 1)
+        lw = QWidget(); lw.setLayout(left)
 
-        nav = QHBoxLayout()
-        nav.addWidget(self.btn_prev)
-        nav.addWidget(self.btn_next)
-        nav.addStretch(1)
-        nav.addWidget(self.btn_close)
+        self.btn_start = QPushButton("Start Rec @ max FPS")
+        self.btn_stop  = QPushButton("Stop Recording"); self.btn_stop.setEnabled(False)
+        self.btn_prev  = QPushButton("◀ Prev")
+        self.btn_next  = QPushButton("Next ▶")
 
-        root = QVBoxLayout(self)
-        root.addWidget(self.video, 1)
-        root.addLayout(nav)
+        if not _RECORDER_AVAILABLE:
+            self.btn_start.setEnabled(False)
+            self.btn_start.setText("Recorder unavailable")
+            self.status.showMessage("Recorder module not found — preview only.", 5000)
 
-        # Signals
+        right = QVBoxLayout()
+        right.addWidget(self.btn_start)
+        right.addWidget(self.btn_stop)
+        right.addSpacing(24)
+        nav = QHBoxLayout(); nav.addWidget(self.btn_prev); nav.addWidget(self.btn_next)
+        right.addLayout(nav)
+        right.addStretch(1)
+        rw = QWidget(); rw.setLayout(right)
+
+        root = QHBoxLayout(); root.addWidget(lw, 3); root.addWidget(rw, 1)
+        w = QWidget(); w.setLayout(root)
+        self.setCentralWidget(w)
+
+        # Signals (support dev or dev.cam)
+        if hasattr(self.dev, "roi"):
+            try: self.dev.roi.connect(self._on_roi_update, Qt.QueuedConnection)
+            except Exception: pass
+        if hasattr(self.dev, "timing"):
+            try: self.dev.timing.connect(self._on_timing_update, Qt.QueuedConnection)
+            except Exception: pass
+        if hasattr(self.dev, "frame"):
+            try: self.dev.frame.connect(self._on_frame_arrived, Qt.QueuedConnection)
+            except Exception: pass
+        elif hasattr(self.dev, "cam") and hasattr(self.dev.cam, "frame"):
+            try: self.dev.cam.frame.connect(self._on_frame_arrived, Qt.QueuedConnection)
+            except Exception: pass
+
         self.btn_prev.clicked.connect(lambda: self._jump(-1))
         self.btn_next.clicked.connect(lambda: self._jump(+1))
-        self.btn_close.clicked.connect(self.close)
+        self.btn_start.clicked.connect(self._start_rec)
+        self.btn_stop.clicked.connect(self._stop_rec)
 
-        if self.cam is not None:
-            if hasattr(self.cam, "roi"):
-                self.cam.roi.connect(self._on_roi_report, Qt.QueuedConnection)
-            if hasattr(self.cam, "frame"):
-                self.cam.frame.connect(self._on_frame, Qt.QueuedConnection)
+        # State
+        self._applied_roi = (0, 0, 0, 0)  # (x, y, w, h)
+        self._fps_now = 20.0
+        self._ui_cap = UI_CAP_MAX
+        self._latest = None  # np.ndarray | None
 
-        # First apply after the dialog shows
-        QTimer.singleShot(0, self._apply_zoom)
+        # UI tick timer (decoupled from frame rate)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._ui_tick)
+        self._timer.start(int(1000.0 / self._ui_cap))
 
-    # -------- camera reports --------
-    def _on_roi_report(self, d: dict) -> None:
+        # Recorder bits (type-only name is quoted to avoid the “variable in type” error)
+        self._rec_thread: Optional[QThread] = None
+        self._rec: Optional['SpotSignalRecorder'] = None  # <- note the quotes
+
+        self._update_cap()
+
+    # ---- camera snapshots ----
+    @Slot(dict)
+    def _on_roi_update(self, d: dict) -> None:
         try:
             w = int(round(float(d.get("Width", 0))))
             h = int(round(float(d.get("Height", 0))))
@@ -111,132 +135,152 @@ class SpotViewerDialog(QDialog):
         except Exception:
             pass
 
-    # -------- navigation --------
-    def _jump(self, delta: int) -> None:
-        if not self.spots:
-            return
-        self.idx = (self.idx + delta) % len(self.spots)
-        self._apply_zoom()
-
-    # -------- zoom logic --------
-    def _apply_zoom(self) -> None:
-        """Compute minimal HW ROI around current spot and apply it; ask for max FPS."""
-        if not self.spots or self.cam is None:
-            return
-
-        cx, cy, area, bw, bh = self.spots[self.idx]
-
-        # Sensor shape from last frame if available
-        H = W = None
-        if self._last_frame_shape is not None:
-            H, W = self._last_frame_shape
-
-        # Minimal ROI around spot (+ padding), snapped to increments
-        want_w = max(self.MIN_W, int(bw + 2 * self.PAD_HW))
-        want_h = max(self.MIN_H, int(bh + 2 * self.PAD_HW))
-        hw = _round_up(want_w, self.W_STEP)
-        hh = _round_up(want_h, self.H_STEP)
-
-        # Center on spot, clamp inside sensor if known
-        x0 = int(round(cx - hw / 2))
-        y0 = int(round(cy - hh / 2))
-        if W is not None and H is not None:
-            x0 = _clamp(x0, 0, max(0, W - hw))
-            y0 = _clamp(y0, 0, max(0, H - hh))
-
-        # Apply ROI; our roi slot will capture the snapped result
-        self.ctrl.set_roi(hw, hh, x0, y0)
-
-        # Ask for max FPS; backend will clamp to fps_max
+    @Slot(dict)
+    def _on_timing_update(self, d: dict) -> None:
         try:
-            self.ctrl.set_timing(float("inf"), None)
+            rf = d.get("resulting_fps") or d.get("fps")
+            if rf is not None:
+                self._fps_now = float(rf)
+                self._update_cap()
         except Exception:
             pass
 
-        self.setWindowTitle(f"Spot viewer — Spot {self.idx + 1}/{len(self.spots)} @ ({cx:.1f},{cy:.1f})")
+    def _update_cap(self) -> None:
+        cap = float(min(UI_CAP_MAX, max(1.0, self._fps_now)))
+        self._timer.setInterval(int(1000.0 / cap))
+        self._ui_cap = cap
 
-    # -------- frame path / software crop --------
-    def _on_frame(self, arr_obj: object) -> None:
-        a16 = np.asarray(arr_obj)
-        if a16.ndim != 2:
+    # ---- frame handling ----
+    @Slot(object)
+    def _on_frame_arrived(self, arr_obj: object) -> None:
+        a = np.asarray(arr_obj)
+        if a.ndim == 2:
+            self._latest = a
+
+    def _ui_tick(self) -> None:
+        a = self._latest
+        if a is None or a.ndim != 2 or not self.spots:
             return
 
-        self._last_frame_shape = a16.shape  # update sensor/ROI knowledge
+        cx, cy, r, _area, _inten = self.spots[self.idx]
+
         ax, ay, aw, ah = self._applied_roi
-
-        # Fallback if we haven't received a ROI report yet
         if aw <= 0 or ah <= 0:
-            ah, aw = a16.shape
-            ax = ay = 0
-
-        # Crop centered on the spot, trimming ROI padding
-        try:
-            cx, cy, area, bw, bh = self.spots[self.idx]
-        except Exception:
-            cx = ax + aw / 2.0
-            cy = ay + ah / 2.0
-            bw = aw
-            bh = ah
+            ah, aw = a.shape; ax = ay = 0
 
         rcx = float(cx) - float(ax)
         rcy = float(cy) - float(ay)
 
-        crop_w = int(max(24, min(aw, bw + 2 * self.PAD_SW)))
-        crop_h = int(max(24, min(ah, bh + 2 * self.PAD_SW)))
+        r_eff = max(4.0, float(r))
+        diameter = max(2.0, 2.0 * r_eff)
+        want = int(math.ceil(diameter + 6))   # a little context
+        side = int(max(10, min(aw, ah, want)))
+        if side % 2:
+            side += 1  # even side helps mosaic parity
 
-        ix = _clamp(int(round(rcx)) - crop_w // 2, 0, max(0, aw - crop_w))
-        iy = _clamp(int(round(rcy)) - crop_h // 2, 0, max(0, ah - crop_h))
-        jx = ix + crop_w
-        jy = iy + crop_h
+        ix = max(0, min(aw - side, int(round(rcx)) - side // 2))
+        iy = max(0, min(ah - side, int(round(rcy)) - side // 2))
 
-        # Bound by actual frame array
-        ix = _clamp(ix, 0, a16.shape[1] - 1)
-        iy = _clamp(iy, 0, a16.shape[0] - 1)
-        jx = _clamp(jx, ix + 1, a16.shape[1])
-        jy = _clamp(jy, iy + 1, a16.shape[0])
+        H, W = a.shape
+        ix = max(0, min(W - 2, ix)); iy = max(0, min(H - 2, iy))
+        jx = max(ix + 1, min(W, ix + side))
+        jy = max(iy + 1, min(H, iy + side))
 
-        crop = a16[iy:jy, ix:jx]
-        self._show_u8(crop)
+        crop = a[iy:jy, ix:jx]
 
-    def _show_u8(self, a16: np.ndarray) -> None:
-        a8 = ((a16.astype(np.uint16, copy=False) + 8) >> 4).astype(np.uint8, copy=False)
+        a8 = (crop >> 4).astype(np.uint8) if crop.dtype == np.uint16 else crop.astype(np.uint8, copy=False)
         if not a8.flags.c_contiguous:
             a8 = np.ascontiguousarray(a8)
         h, w = a8.shape
         qimg = QImage(a8.data, w, h, w, QImage.Format_Grayscale8)
-        pm = QPixmap.fromImage(qimg)
-        self.video.setPixmap(pm.scaled(self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.video.setPixmap(QPixmap.fromImage(qimg))
 
-    # -------- restore on close --------
-    def closeEvent(self, e) -> None:
-        # Restore ROI
-        try:
-            w, h, x, y = self._orig_roi
-            if w and h:
-                self.ctrl.set_roi(int(w), int(h), int(x), int(y))
-            else:
-                if hasattr(self.ctrl, "full_sensor"):
-                    self.ctrl.full_sensor()
-        except Exception:
-            pass
+    # ---- navigation ----
+    def _jump(self, d: int) -> None:
+        if not self.spots:
+            return
+        self.idx = (self.idx + d) % len(self.spots)
 
-        # Restore FPS
-        try:
-            if self._orig_fps is not None:
-                self.ctrl.set_timing(float(self._orig_fps), None)
-        except Exception:
-            pass
+    # ---- recorder control ----
+    def _start_rec(self) -> None:
+        if not _RECORDER_AVAILABLE:
+            return
+        if not self.spots:
+            self.status.showMessage("No spots available (run Detect first).", 2500)
+            return
 
-        # Disconnect
-        try:
-            if self.cam is not None and hasattr(self.cam, "frame"):
-                self.cam.frame.disconnect(self._on_frame)
-        except Exception:
-            pass
-        try:
-            if self.cam is not None and hasattr(self.cam, "roi"):
-                self.cam.roi.disconnect(self._on_roi_report)
-        except Exception:
-            pass
+        cam_for_rec = getattr(self.dev, "cam", None)
+        if cam_for_rec is None or not (hasattr(cam_for_rec, "roi") and hasattr(cam_for_rec, "frame")):
+            cam_for_rec = self.dev
 
+        if not (hasattr(cam_for_rec, "roi") and hasattr(cam_for_rec, "frame")):
+            self.status.showMessage("Recorder can’t find a camera with .roi/.frame; preview only.", 4000)
+            return
+
+        cx, cy, r, area, inten = self.spots[self.idx]
+        spot = SpotRT(cx, cy, r, int(area), int(inten))  # runtime class
+
+        out_dir = os.path.join(os.getcwd(), "captures")
+        cfg = RecorderConfigRT(
+            out_dir=out_dir,
+            base_name=f"spot{self.idx+1}",
+            chunk_len=20000,
+            maximize_camera_fps=True,
+        )
+
+        self._rec_thread = QThread(self)
+        self._rec = SpotSignalRecorderRT(cam_for_rec, self.dev, spot, cfg)  # runtime class
+        self._rec.moveToThread(self._rec_thread)
+
+        self._rec_thread.started.connect(self._rec.start)
+        self._rec.progress.connect(lambda n: self.status.showMessage(f"Recording… {n} samples", 1000))
+        self._rec.error.connect(lambda msg: self.status.showMessage(f"Recorder error: {msg}", 4000))
+        self._rec.stopped.connect(self._rec_thread.quit)
+
+        self._rec_thread.start()
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.status.showMessage("Recording signals at max FPS (preview capped).", 3000)
+
+    def _stop_rec(self) -> None:
+        if not _RECORDER_AVAILABLE:
+            return
+        if self._rec:
+            try: self._rec.stop()
+            except Exception: pass
+        if self._rec_thread:
+            self._rec_thread.wait(3000)
+        self._rec = None
+        self._rec_thread = None
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.status.showMessage("Recorder stopped.", 2000)
+
+    # ---- cleanup ----
+    def closeEvent(self, e):
+        try: self._timer.stop()
+        except Exception: pass
+        try:
+            if hasattr(self.dev, "frame"):
+                self.dev.frame.disconnect(self._on_frame_arrived)
+        except Exception: pass
+        try:
+            if hasattr(self.dev, "cam") and hasattr(self.dev.cam, "frame"):
+                self.dev.cam.frame.disconnect(self._on_frame_arrived)
+        except Exception: pass
+        try:
+            if hasattr(self.dev, "roi"):
+                self.dev.roi.disconnect(self._on_roi_update)
+        except Exception: pass
+        try:
+            if hasattr(self.dev, "timing"):
+                self.dev.timing.disconnect(self._on_timing_update)
+        except Exception: pass
+        try: self._stop_rec()
+        except Exception: pass
         super().closeEvent(e)
+
+
+# Back-compat alias
+SpotViewerDialog = SpotViewerWindow
+__all__ = ["SpotViewerWindow", "SpotViewerDialog"]

@@ -1,4 +1,3 @@
-# src/polarcam/app/spot_detect.py
 from __future__ import annotations
 from typing import List, Tuple
 import numpy as np
@@ -8,8 +7,8 @@ try:
 except Exception as e:
     raise RuntimeError("spot_detect requires SciPy (scipy.ndimage).") from e
 
-# Spot tuple (what main_window expects):
-# (cx, cy, area_px, approx_w, approx_h) — all in FRAME coordinates
+# Old/desired spot tuple:
+#   (cx, cy, r, area, inten)
 Spot = Tuple[float, float, float, int, int]
 
 
@@ -20,119 +19,118 @@ def _disk(r: int) -> np.ndarray:
     return (xx * xx + yy * yy) <= r * r
 
 
+def _remove_small_objects(mask: np.ndarray, min_area: int) -> np.ndarray:
+    """SciPy-only version of skimage.remove_small_objects."""
+    if min_area <= 1:
+        return mask
+    lab, n = ndi.label(mask)
+    if n == 0:
+        return mask
+    areas = ndi.sum(mask, labels=lab, index=np.arange(1, n + 1)).astype(np.int64)
+    kill = set(int(i + 1) for i, a in enumerate(areas) if a < int(min_area))
+    if not kill:
+        return mask
+    out = mask.copy()
+    # zero labels to be removed
+    for k in kill:
+        out[lab == k] = False
+    return out
+
+
 def detect_spots_oneframe(
     img16: np.ndarray,
     *,
-    thr_mode: str = "absolute",      # "absolute" (DN) or "percentile"
-    thr_value: float = 1200.0,       # DN or [0..100] percentile
-    min_area: int = 6,               # px
-    max_area: int = 5000,            # px
-    open_radius: int = 1,            # px (morphology)
-    close_radius: int = 1,           # px (morphology)
+    thr_mode: str = "absolute",   # "absolute" (DN) or "percentile"
+    thr_value: float = 1200.0,    # DN or [0..100] percentile
+    min_area: int = 6,            # px (match previous defaults better)
+    max_area: int = 5000,         # px
+    open_radius: int = 2,         # px — like the previous app (de-speckle first)
+    close_radius: int = 1,        # px — mend tiny gaps
     remove_border: bool = True,
-    max_spots: int = 500,
-    dedup_radius: float = 6.0,       # px, suppress very-close duplicates
-    # extras that help tame CFA texture while keeping semantics:
-    fill_holes: bool = True,         # fill small holes after morphology
-    peak_pick: bool = True,          # choose the strongest pixel inside each blob
-    peak_sigma: float = 0.7,         # Gaussian smoothing before peak picking
+    debug: bool = False,
 ) -> List[Spot]:
     """
-    One-frame bright-spot detector on raw 12-bit data.
+    Old detection logic adapted to a *single* frame:
 
-    Returns a list of (cx, cy, area_px, approx_w, approx_h), sorted by area desc.
+      1) threshold on intensity (absolute or percentile)
+      2) binary opening (disk=2)
+      3) remove small objects (min_area)
+      4) binary closing (disk=1)
+      5) label (4-connectivity), compute centroid + area
+      6) radius r = sqrt(area / pi), intensity from frame at rounded centroid
     """
-    if img16.ndim != 2:
-        return []
+    a = img16.astype(np.uint16, copy=False)
+    H, W = a.shape
 
-    a_u16 = img16.astype(np.uint16, copy=False)
-    H, W = a_u16.shape
-
-    # ----- threshold mask on the ORIGINAL DN image (keeps "absolute" semantics)
+    # --- 1) threshold ---
     if thr_mode.lower().startswith("perc"):
-        t = float(np.percentile(a_u16, np.clip(thr_value, 0, 100)))
+        t = float(np.percentile(a, np.clip(thr_value, 0, 100)))
+        mode_str = f"percentile {thr_value:.1f}"
     else:
         t = float(thr_value)
-    mask = a_u16 >= t
+        mode_str = f"absolute DN {thr_value:.1f}"
+    mask = a >= t
 
-    # morphology to remove speckle and connect near pixels
+    # strip 1px border to prevent edge ribbons
+    if remove_border:
+        mask[0, :] = mask[-1, :] = False
+        mask[:, 0] = mask[:, -1] = False
+
+    # --- 2) opening ---
     if open_radius > 0:
         mask = ndi.binary_opening(mask, structure=_disk(open_radius))
+
+    # --- 3) remove tiny blobs early ---
+    mask = _remove_small_objects(mask, min_area=max(1, int(min_area)))
+
+    # --- 4) closing ---
     if close_radius > 0:
         mask = ndi.binary_closing(mask, structure=_disk(close_radius))
-    if fill_holes:
-        mask = ndi.binary_fill_holes(mask)
 
-    # strip 1-px frame border if requested
-    if remove_border:
-        mask[0, :] = False
-        mask[-1, :] = False
-        mask[:, 0] = False
-        mask[:, -1] = False
-
-    lab, n = ndi.label(mask)
+    # --- 5) label + props (SciPy-only) ---
+    lab, n = ndi.label(mask, structure=np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8))
     if n == 0:
+        if debug:
+            print(f"[Detect] HxW={H}x{W}  mode={mode_str}  thr={t:.1f}  pixels>thr=0")
         return []
 
-    # ----- optional peak image for stable "one spot per blob"
-    peak_img = a_u16.astype(np.float32, copy=False)
-    if peak_pick and peak_sigma > 0:
-        peak_img = ndi.gaussian_filter(peak_img, float(peak_sigma), mode="nearest")
-
+    areas = ndi.sum(mask, labels=lab, index=np.arange(1, n + 1)).astype(np.int64)
+    # center of mass on the *binary* mask (unweighted), same as regionprops centroid
+    centers = ndi.center_of_mass(mask, lab, index=np.arange(1, n + 1))
     boxes = ndi.find_objects(lab)
-    spots: List[Spot] = []
 
+    out: List[Spot] = []
     for i in range(n):
+        area = int(areas[i])
+        if area < int(min_area) or area > int(max_area):
+            continue
         sl = boxes[i]
         if sl is None:
             continue
-
         r0, r1 = sl[0].start, sl[0].stop
         c0, c1 = sl[1].start, sl[1].stop
         if remove_border and (r0 <= 0 or c0 <= 0 or r1 >= H or c1 >= W):
-            # touches border
+            # still touching border → skip
             continue
 
-        reg = (lab[sl] == (i + 1))
-        area = int(reg.sum())
-        if area < int(min_area) or area > int(max_area):
-            continue
+        cy, cx = centers[i]  # note: center_of_mass returns (row, col)
+        # intensity from original frame at rounded centroid
+        iy, ix = int(round(cy)), int(round(cx))
+        iy = max(0, min(H - 1, iy))
+        ix = max(0, min(W - 1, ix))
+        inten = int(a[iy, ix])
 
-        # centroid (uniform) as a fallback
-        yy, xx = np.nonzero(reg)
-        cy = float(r0 + (yy.mean() if yy.size else 0.0))
-        cx = float(c0 + (xx.mean() if xx.size else 0.0))
+        # radius from area
+        r = float(np.sqrt(max(1.0, float(area)) / np.pi))
+        out.append((float(cx), float(cy), r, int(area), int(inten)))
 
-        # pick the strongest pixel inside this region for a single, stable center
-        if peak_pick and reg.any():
-            vals = peak_img[sl][reg]
-            j = int(vals.argmax())
-            flat_idx = np.flatnonzero(reg)[j]
-            ry, rx = np.unravel_index(flat_idx, reg.shape)
-            cy = float(r0 + ry)
-            cx = float(c0 + rx)
+    if not out:
+        if debug:
+            print(f"[Detect] HxW={H}x{W}  mode={mode_str}  thr={t:.1f}  pixels>thr={int(mask.sum())}  spots=0")
+        return []
 
-        approx_h = int(r1 - r0)
-        approx_w = int(c1 - c0)
-
-        spots.append((cx, cy, float(area), max(1, approx_w), max(1, approx_h)))
-
-    # sort by area desc
-    spots.sort(key=lambda s: s[2], reverse=True)
-
-    # ----- de-duplicate very close centers (greedy NMS in coordinate space)
-    if len(spots) > 1 and dedup_radius > 0:
-        keep: List[Spot] = []
-        r2 = float(dedup_radius) * float(dedup_radius)
-        for s in spots:
-            x0, y0 = s[0], s[1]
-            if any((x0 - t[0]) ** 2 + (y0 - t[1]) ** 2 <= r2 for t in keep):
-                continue
-            keep.append(s)
-            if len(keep) >= max_spots:
-                break
-        spots = keep
-    else:
-        spots = spots[:max_spots]
-
-    return spots
+    # sort bright-first (as before)
+    out.sort(key=lambda z: -z[4])
+    if debug:
+        print(f"[Detect] spots={len(out)}  min/max area={min(a for *_, a, __ in [(*s[:4], s[3]) for s in out]):d}/{max(s[3] for s in out):d}")
+    return out

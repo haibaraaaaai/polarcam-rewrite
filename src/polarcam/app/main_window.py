@@ -1,11 +1,12 @@
-# src/polarcam/app/main_window.py
 from __future__ import annotations
 
+import os
 import time
+import math
 from typing import Optional, List, Tuple
 import numpy as np
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QImage, QPixmap, QIntValidator, QDoubleValidator, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,24 +24,26 @@ from PySide6.QtWidgets import (
     QWidget,
     QComboBox,
     QGroupBox,
-    QDialog,
 )
 
 from polarcam.app.lut_widget import HighlightLUTWidget
 from polarcam.app.spot_detect import detect_spots_oneframe
 from polarcam.app.spot_viewer import SpotViewerDialog
 
-# Spot tuple: (cx_abs, cy_abs, area, bbox_w, bbox_h)
+# NEW: cycling recorder
+from polarcam.app.spot_cycler import MultiSpotCycler, CycleConfig
+
+# Old/desired spot tuple: (cx, cy, r, area, inten)
 Spot = Tuple[float, float, float, int, int]
 
 
 class MainWindow(QMainWindow):
-    """Lean GUI with ROI/Timing/Gains + LUT + spot tools + varmap. Live video."""
+    """Lean GUI: Open/Start/Stop/Close + ROI/Timing + Gains + Highlight LUT + Spot tools. Live video.
+       Adds: Cycle Spots recorder that hops across selected spots (1 s/spot), saves 4×pol means from
+       the displayed/software crop only, records at max camera FPS while preview is capped at 20 FPS.
+    """
     detect_done = Signal(object)
 
-    # ------------------------------------------
-    # init / build
-    # ------------------------------------------
     def __init__(self, ctrl) -> None:
         super().__init__()
         self.ctrl = ctrl
@@ -57,19 +60,20 @@ class MainWindow(QMainWindow):
         self.tone.paramsChanged.connect(self._on_tone_params)
         self._on_tone_params(*self.tone.params())
 
-        # state
+        # detection / overlay state
         self._spots: List[Spot] = []
         self._collecting = False
+        self._collect_frames: List[np.ndarray] = []
         self._detect_params: Tuple = tuple()
         self._detect_conn_active = False
+        self._video_paused = False
 
-        self._varmap = None
-        self._last_pm: Optional[QPixmap] = None
-        self._roi_offset = (0, 0)   # (OffsetX, OffsetY)
-        self._roi_size = (0, 0)     # (Width, Height)
-        self._hist_t_last = 0.0
+        # preview throttle (used during Cycle mode)
+        self._cycle_active = False
+        self._preview_cap_fps = 20.0  # cap preview to 20 fps while cycling
+        self._last_preview_t = 0.0
 
-        # UI
+        # build UI
         self._build_video()
         self._build_toolbar()
         self._build_forms()
@@ -77,9 +81,10 @@ class MainWindow(QMainWindow):
         self._build_spot_list_ui()
         self._assemble_layout()
 
+        # starting button states
         self._set_buttons(open_enabled=True, start=False, stop=False, close=False)
 
-        # wire controller/backend signals
+        # wire controller/backend signals if present
         cam = getattr(self.ctrl, "cam", None)
         if cam is not None:
             cam.opened.connect(self._on_open)
@@ -91,11 +96,9 @@ class MainWindow(QMainWindow):
             cam.timing.connect(self._on_timing)
             cam.roi.connect(self._on_roi)
             cam.gains.connect(self._on_gains)
-            cam.desaturated.connect(self._on_desaturated)
-            if hasattr(cam, "auto_desat_started"):
-                cam.auto_desat_started.connect(self._on_desat_started)
-            if hasattr(cam, "auto_desat_finished"):
-                cam.auto_desat_finished.connect(self._on_desat_finished)
+            if hasattr(cam, "desaturated"): cam.desaturated.connect(self._on_desaturated)
+            if hasattr(cam, "auto_desat_started"): cam.auto_desat_started.connect(self._on_desat_started)
+            if hasattr(cam, "auto_desat_finished"): cam.auto_desat_finished.connect(self._on_desat_finished)
         else:
             self.status.showMessage("No camera backend attached.", 4000)
 
@@ -116,7 +119,24 @@ class MainWindow(QMainWindow):
         self.btn_view_spot.clicked.connect(self._view_selected_spots)
         self.btn_remove_spot.clicked.connect(self._remove_selected_spots)
 
+        # NEW: Cycle buttons
+        self.btn_cycle_start.clicked.connect(self._start_cycle_clicked)
+        self.btn_cycle_stop.clicked.connect(self._stop_cycle_clicked)
+
         self.detect_done.connect(self._handle_detect_done, Qt.QueuedConnection)
+
+        self._varmap = None
+        self._last_pm: Optional[QPixmap] = None
+
+        self._roi_offset = (0, 0)   # (OffsetX, OffsetY)
+        self._roi_size = (0, 0)     # (Width, Height)
+
+        # histogram rate-limiting
+        self._hist_t_last = 0.0
+
+        # cycle worker state
+        self._cycle_thread: Optional[QThread] = None
+        self._cycler = None  # MultiSpotCycler instance
 
     # ---------- builders ----------
     def _build_video(self) -> None:
@@ -148,10 +168,10 @@ class MainWindow(QMainWindow):
         self.btn_apply_roi = QPushButton("Apply ROI")
         self.btn_full_roi = QPushButton("Full sensor")
 
-        # Timing form — exposure shown/edited in MILLISECONDS
+        # Timing form (EXPOSURE IN MILLISECONDS)
         self.ed_fps = QLineEdit("20.0")
         self.ed_exp = QLineEdit("50.0")  # ms
-        fpsv = QDoubleValidator(0.01, 1_000.0, 3, self); fpsv.setNotation(QDoubleValidator.StandardNotation)
+        fpsv = QDoubleValidator(0.01, 100000.0, 3, self); fpsv.setNotation(QDoubleValidator.StandardNotation)
         expv = QDoubleValidator(0.01, 2_000.0, 3, self); expv.setNotation(QDoubleValidator.StandardNotation)
         self.ed_fps.setValidator(fpsv)
         self.ed_exp.setValidator(expv)
@@ -182,7 +202,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_full_roi)
         rw = QWidget(); rw.setLayout(row)
         self._form.addRow(rw)
-
         self._form.addRow("FPS", self.ed_fps)
         self._form.addRow("Exposure (ms)", self.ed_exp)
         rowt = QHBoxLayout(); rowt.addWidget(self.btn_apply_tim); rowt.addWidget(self.btn_desat)
@@ -196,7 +215,7 @@ class MainWindow(QMainWindow):
         self._form.addRow(rg)
 
     def _build_detect_ui(self) -> None:
-        box = QGroupBox("Detect spots (single frame)")
+        box = QGroupBox("Detect spots (single frame, old logic)")
         f = QFormLayout(box)
 
         self.cmb_thr_mode = QComboBox()
@@ -224,11 +243,18 @@ class MainWindow(QMainWindow):
         self.spot_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.btn_view_spot = QPushButton("View spot…")
         self.btn_remove_spot = QPushButton("Remove selected")
+        # NEW: Cycle controls
+        self.btn_cycle_start = QPushButton("Start Cycle (1 s / spot)")
+        self.btn_cycle_stop  = QPushButton("Stop Cycle")
+        self.btn_cycle_stop.setEnabled(False)
+
         row = QHBoxLayout()
         row.addWidget(self.btn_view_spot)
         row.addWidget(self.btn_remove_spot)
         v.addWidget(self.spot_list, 1)
         v.addLayout(row)
+        v.addWidget(self.btn_cycle_start)
+        v.addWidget(self.btn_cycle_stop)
         self._form.addRow(box)
 
     def _assemble_layout(self) -> None:
@@ -250,9 +276,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(stop)
         self.btn_close.setEnabled(close)
 
-    # ------------------------------------------
-    # backend signal handlers
-    # ------------------------------------------
+    # ---------- backend signal handlers ----------
     def _on_open(self, name: str) -> None:
         self.status.showMessage(f"Opened: {name}", 1500)
         self._set_buttons(open_enabled=False, start=True, stop=False, close=True)
@@ -273,33 +297,35 @@ class MainWindow(QMainWindow):
         self._set_buttons(open_enabled=True, start=False, stop=False, close=False)
 
     def _on_error(self, msg: str) -> None:
-        self.status.showMessage(f"Error: { msg }", 5000)
+        self.status.showMessage(f"Error: {msg}", 5000)
         QMessageBox.warning(self, "Camera error", msg)
 
     def _on_frame(self, arr_obj: object) -> None:
-        """Apply LUT (if any) and draw current overlays; update histogram ~2 Hz."""
         try:
             a16 = np.asarray(arr_obj)
             if a16.ndim != 2:
                 return
-            h, w = a16.shape
 
             # histogram ~2 Hz for LUT widget
             if time.time() - self._hist_t_last > 0.5:
                 self._hist_t_last = time.time()
                 vals = (a16.astype(np.uint16, copy=False) >> 4).ravel()
                 hist = np.bincount(vals, minlength=256)
-                if hist.size > 256:
-                    hist = hist[:256]
+                if hist.size > 256: hist = hist[:256]
                 self.tone.setHistogram256(hist)
 
+            # PREVIEW THROTTLE while cycling: cap to ~20 fps
+            if self._cycle_active and self._preview_cap_fps and self._preview_cap_fps > 0:
+                now = time.perf_counter()
+                if now - self._last_preview_t < (1.0 / float(self._preview_cap_fps)):
+                    return
+                self._last_preview_t = now
+
             if self._lut is not None:
-                if a16.dtype != np.uint16:
-                    a16 = a16.astype(np.uint16, copy=False)
+                if a16.dtype != np.uint16: a16 = a16.astype(np.uint16, copy=False)
                 a8 = self._lut[a16]
             else:
-                if a16.dtype != np.uint16:
-                    a16 = a16.astype(np.uint16, copy=False)
+                if a16.dtype != np.uint16: a16 = a16.astype(np.uint16, copy=False)
                 a8 = ((a16 + 8) >> 4).astype(np.uint8, copy=False)
 
             if not a8.flags.c_contiguous:
@@ -331,21 +357,21 @@ class MainWindow(QMainWindow):
         ox, oy = self._roi_offset
         for i, s in enumerate(self._spots):
             try:
-                # s are absolute coords; bring into current frame coords
-                cx = int(round(float(s[0]) - ox))
-                cy = int(round(float(s[1]) - oy))
-                r = 6
+                cx, cy, r, area, inten = s
+                cx = int(round(cx - ox))
+                cy = int(round(cy - oy))
+                rr = max(1, min(40, int(round(r))))   # radius in px
             except Exception:
                 continue
 
             if 0 <= cx < w and 0 <= cy < h:
-                p.drawEllipse(cx - r, cy - r, 2 * r, 2 * r)
-                p.drawText(cx + r + 3, cy - r - 2, f"{i + 1}")
+                p.drawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
+                p.drawText(cx + rr + 3, cy - rr - 2, f"{i + 1}")
         p.end()
         return pm
 
     def _on_timing(self, d: dict) -> None:
-        """Keep exposure displayed in *milliseconds*."""
+        """Keep exposure displayed in *milliseconds* (label says ms)."""
         try:
             fps = d.get("fps")
             exp_us = d.get("exposure_us")
@@ -354,12 +380,9 @@ class MainWindow(QMainWindow):
             if exp_us is not None:
                 self.ed_exp.setText(f"{float(exp_us) / 1000.0:.3f}")  # μs → ms
             msg = []
-            if fps is not None:
-                msg.append(f"FPS={float(fps):.3f}")
-            if exp_us is not None:
-                msg.append(f"EXP={float(exp_us) / 1000.0:.3f} ms")
-            if msg:
-                self.status.showMessage("Timing applied: " + "  ".join(msg), 2000)
+            if fps is not None:   msg.append(f"FPS={float(fps):.3f}")
+            if exp_us is not None:msg.append(f"EXP={float(exp_us)/1000.0:.3f} ms")
+            if msg: self.status.showMessage("Timing applied: " + "  ".join(msg), 2000)
         except Exception:
             pass
 
@@ -375,6 +398,7 @@ class MainWindow(QMainWindow):
                 v = d.get(key)
                 if v is not None:
                     edit.setText(str(int(round(float(v)))))
+            # keep numeric copies for overlays
             W = d.get("Width"); H = d.get("Height")
             X = d.get("OffsetX"); Y = d.get("OffsetY")
             if None not in (W, H, X, Y):
@@ -394,37 +418,28 @@ class MainWindow(QMainWindow):
             def rng(dct: dict) -> str:
                 mn = dct.get("min"); mx = dct.get("max"); inc = dct.get("inc")
                 bits = []
-                if mn is not None and mx is not None:
-                    bits.append(f"{float(mn):.3f} … {float(mx):.3f}")
-                if inc is not None:
-                    bits.append(f"inc {float(inc):.3f}")
+                if mn is not None and mx is not None: bits.append(f"{float(mn):.3f} … {float(mx):.3f}")
+                if inc is not None: bits.append(f"inc {float(inc):.3f}")
                 return "  ".join(bits)
             self._lbl_gain_ana.setText(rng(ana)); self._lbl_gain_dig.setText(rng(dig))
         except Exception:
             pass
 
-    # ------------------------------------------
-    # detect
-    # ------------------------------------------
+    # ---------- detect ----------
     def _detect_clicked(self) -> None:
         if self._collecting:
             return
         mode = self.cmb_thr_mode.currentText().strip().lower()
-        try:
-            thr_val = float(self.ed_thr_val.text())
-        except Exception:
-            thr_val = 1200.0
-        try:
-            minA = int(float(self.ed_minA.text()))
-        except Exception:
-            minA = 6
-        try:
-            maxA = int(float(self.ed_maxA.text()))
-        except Exception:
-            maxA = 5000
+        try: thr_val = float(self.ed_thr_val.text())
+        except Exception: thr_val = 1200.0
+        try: minA = int(float(self.ed_minA.text()))
+        except Exception: minA = 6
+        try: maxA = int(float(self.ed_maxA.text()))
+        except Exception: maxA = 5000
 
         self._detect_params = (mode, thr_val, minA, maxA)
         self._collecting = True
+        self._collect_frames = []
         self.btn_detect.setEnabled(False)
         self.status.showMessage("Detect: grabbing one frame…", 0)
 
@@ -432,191 +447,57 @@ class MainWindow(QMainWindow):
             self.ctrl.cam.frame.connect(self._collect_for_detect_1f, Qt.QueuedConnection)
             self._detect_conn_active = True
 
-    def _debug_cluster_summary(self, spots: List[Spot], join_px: float = 8.0) -> None:
-        """Quick-and-dirty cluster sizes: count how many spots lie within join_px of a seed."""
-        try:
-            if not spots:
-                print("[Detect] cluster summary: no spots.")
-                return
-            pts = np.array([(float(s[0]), float(s[1])) for s in spots], dtype=np.float64)
-            used = np.zeros(len(pts), dtype=bool)
-            sizes = []
-            for i in range(len(pts)):
-                if used[i]:
-                    continue
-                d = np.hypot(pts[:, 0] - pts[i, 0], pts[:, 1] - pts[i, 1])
-                idx = np.where(d <= float(join_px))[0]
-                used[idx] = True
-                sizes.append(len(idx))
-            sizes.sort(reverse=True)
-            print(f"[Detect] cluster summary (join={join_px}px): top sizes {sizes[:10]}")
-        except Exception as e:
-            print(f"[Detect] cluster summary error: {e}")
-
-    def _merge_close_spots(self, spots: List[Spot], join_px: float = 8.0) -> List[Spot]:
-        """Greedy merge: within join_px, keep the spot with the largest area."""
-        n = len(spots)
-        if n < 2:
-            return spots
-        pts = np.array([(s[0], s[1]) for s in spots], dtype=np.float64)
-        used = np.zeros(n, dtype=bool)
-        merged: List[Spot] = []
-        for i in range(n):
-            if used[i]:
-                continue
-            d = np.hypot(pts[:, 0] - pts[i, 0], pts[:, 1] - pts[i, 1])
-            idx = np.where(d <= float(join_px))[0]
-            used[idx] = True
-            # choose max area within cluster
-            best = max(idx, key=lambda k: float(spots[k][2]) if len(spots[k]) > 2 else 0.0)
-            merged.append(spots[best])
-        return merged
-
-    def _popup_detect_preview(self, frame8: np.ndarray, spots_xy: List[Tuple[float, float]]) -> None:
-        """Show the exact frame used for detection with spot centers overlaid (frame coords)."""
-        h, w = frame8.shape
-        qimg = QImage(frame8.data, w, h, w, QImage.Format_Grayscale8)
-        pm = QPixmap.fromImage(qimg.copy())
-
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        pen = QPen(Qt.red, 2)
-        p.setPen(pen)
-        for x, y in spots_xy:
-            cx = int(round(x))
-            cy = int(round(y))
-            r = 6
-            if 0 <= cx < w and 0 <= cy < h:
-                p.drawEllipse(cx - r, cy - r, 2 * r, 2 * r)
-        p.end()
-
-        class _ImgDlg(QDialog):
-            def __init__(self, parent=None):
-                super().__init__(parent)
-                self.setWindowTitle("Detect preview (exact frame)")
-                self.label = QLabel(self); self.label.setAlignment(Qt.AlignCenter)
-                lay = QVBoxLayout(self); lay.addWidget(self.label)
-                self._pm = None
-
-            def set_pixmap(self, pix):
-                self._pm = pix
-                self._resize_to_label()
-
-            def resizeEvent(self, ev):
-                super().resizeEvent(ev)
-                self._resize_to_label()
-
-            def _resize_to_label(self):
-                if self._pm is None:
-                    return
-                self.label.setPixmap(self._pm.scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-        dlg = _ImgDlg(self)
-        dlg.resize(900, 650)
-        dlg.set_pixmap(pm)
-        dlg.show()  # non-modal so the stream continues
-
     def _collect_for_detect_1f(self, arr_obj: object) -> None:
-        # disconnect immediately; we need only one sample
+        if not self._detect_conn_active:
+            return
         try:
-            if self._detect_conn_active:
-                self.ctrl.cam.frame.disconnect(self._collect_for_detect_1f)
-                self._detect_conn_active = False
+            self.ctrl.cam.frame.disconnect(self._collect_for_detect_1f)
         except Exception:
             pass
+        self._detect_conn_active = False
 
         try:
             img = np.asarray(arr_obj)
             if img.ndim != 2:
                 raise RuntimeError("Frame is not 2D.")
-            H, W = img.shape
-            ox, oy = self._roi_offset
             mode, thr_val, minA, maxA = self._detect_params
 
-            # Compute absolute DN threshold (for logging)
-            if (mode or "").lower() == "percentile":
-                thr_abs = float(np.percentile(img, float(thr_val)))
-                mode_str = f"percentile {thr_val:.3f}% -> DN {thr_abs:.1f}"
-            else:
-                thr_abs = float(thr_val)
-                mode_str = f"absolute DN {thr_abs:.1f}"
-
-            above = int((img.astype(np.uint16, copy=False) > thr_abs).sum())
-            print(
-                f"[Detect] HxW={H}x{W}  ROI@({ox},{oy})  "
-                f"mode={mode_str}  min={int(img.min())} max={int(img.max())} "
-                f"mean={float(img.mean()):.1f}  pixels>thr={above}"
-            )
-
-            # Run detector in frame coords
-            spots_rel = detect_spots_oneframe(
+            spots = detect_spots_oneframe(
                 img.astype(np.uint16, copy=False),
-                thr_mode=("percentile" if (mode or "").lower() == "percentile" else "absolute"),
-                thr_value=float(thr_val),
-                min_area=int(minA),
-                max_area=int(maxA),
-                open_radius=1,
+                thr_mode="percentile" if mode == "percentile" else "absolute",
+                thr_value=thr_val,
+                min_area=minA,
+                max_area=maxA,
+                open_radius=2,
                 close_radius=1,
+                remove_border=True,
+                debug=True,
             )
 
-            # Build absolute coords and filter OOB robustly
-            spots_abs: List[Spot] = []
-            preview_xy: List[Tuple[float, float]] = []  # for the preview (frame coords)
-            for s in spots_rel or []:
-                try:
-                    cx, cy, area, bw, bh = s
-                    cx_f = float(cx); cy_f = float(cy)
-                    if not (0.0 <= cx_f < float(W) and 0.0 <= cy_f < float(H)):
-                        continue
-                    preview_xy.append((cx_f, cy_f))
-                    spots_abs.append((
-                        cx_f + float(ox),
-                        cy_f + float(oy),
-                        float(area),
-                        int(max(1, round(bw))),
-                        int(max(1, round(bh))),
-                    ))
-                except Exception:
-                    continue
+            # show overlays on the exact frame used for detection
+            self._spots = list(spots)
+            a16 = img.astype(np.uint16, copy=False)
+            a8 = self._lut[a16] if self._lut is not None else ((a16 + 8) >> 4).astype(np.uint8, copy=False)
+            if not a8.flags.c_contiguous: a8 = np.ascontiguousarray(a8)
+            pm = self._compose_pixmap_with_overlays(a8)
+            self._last_pm = pm
+            self._refresh_video_view()
 
-            n0 = len(spots_abs)
-            # Merge near-duplicates
-            spots_abs = self._merge_close_spots(spots_abs, join_px=8.0)
-            n1 = len(spots_abs)
-
-            if n0:
-                areas = np.array([s[2] for s in spots_abs], dtype=float)
-                q10, q50, q90 = np.percentile(areas, [10, 50, 90]).tolist()
-                print(f"[Detect] spots(before/after)={n0}/{n1}  area q10/50/90 = {q10:.1f}/{q50:.1f}/{q90:.1f}")
-                self._debug_cluster_summary(spots_abs, join_px=8.0)
-            else:
-                print("[Detect] spots=0")
-
-            # Show exact frame + overlay so we know what was segmented
-            # Use current LUT for readability if available, otherwise 12->8
-            if self._lut is not None:
-                frame8 = self._lut[img.astype(np.uint16, copy=False)]
-            else:
-                frame8 = ((img.astype(np.uint16, copy=False) + 8) >> 4).astype(np.uint8, copy=False)
-            if not frame8.flags.c_contiguous:
-                frame8 = np.ascontiguousarray(frame8)
-            self._popup_detect_preview(frame8, preview_xy)
-
-            self.detect_done.emit(("ok", spots_abs))
-
+            self.detect_done.emit(("ok", spots))
         except Exception as e:
             self.detect_done.emit(("err", str(e)))
 
     def _handle_detect_done(self, payload: object) -> None:
-        kind, data = payload
         self._collecting = False
         self.btn_detect.setEnabled(True)
-
+        if not isinstance(payload, (list, tuple)) or len(payload) < 2:
+            self._spots = []
+            self._refresh_spot_list()
+            self.status.showMessage("Detect failed: bad payload.", 3000)
+            return
+        kind, data = payload
         if kind == "ok":
-            spots = data or []
-            if len(spots) > 800:
-                print(f"[Detect] too many spots ({len(spots)}); showing first 800.")
-                spots = spots[:800]
+            spots: List[Spot] = list(data or [])
             self._spots = spots
             self._refresh_spot_list()
             self.status.showMessage(f"Detect: {len(self._spots)} spot(s).", 3000)
@@ -628,10 +509,8 @@ class MainWindow(QMainWindow):
     def _refresh_spot_list(self) -> None:
         self.spot_list.clear()
         for i, s in enumerate(self._spots):
-            cx, cy, a, w, h = s
-            item = QListWidgetItem(
-                f"#{i + 1}  (x={cx:.1f}, y={cy:.1f})  A={a:.1f}  wh≈({int(w)},{int(h)})"
-            )
+            cx, cy, r, area, inten = s
+            item = QListWidgetItem(f"#{i+1}  (x={cx:.1f}, y={cy:.1f})  r≈{r:.1f}px  A={area}  I={inten}")
             self.spot_list.addItem(item)
 
     def _clear_overlays(self) -> None:
@@ -641,7 +520,17 @@ class MainWindow(QMainWindow):
 
     # ---------- view/remove spots ----------
     def _selected_spot_indices(self) -> List[int]:
-        return sorted(set(idx.row() for idx in self.spot_list.selectedIndexes()))
+        return sorted({it.row() for it in self.spot_list.selectedIndexes()})
+
+    def _resume_main_video(self) -> None:
+        if self._video_paused:
+            try:
+                # reconnect only if not already connected
+                self.ctrl.cam.frame.connect(self._on_frame, Qt.QueuedConnection)
+                print("[MainWindow] Live preview resumed.")
+            except Exception:
+                pass
+            self._video_paused = False
 
     def _view_selected_spots(self) -> None:
         idxs = self._selected_spot_indices()
@@ -652,51 +541,103 @@ class MainWindow(QMainWindow):
             idxs = [0]
         sel_spots = [self._spots[i] for i in idxs]
 
-        # Snapshot current ROI + FPS so the viewer can restore them
-        try:
-            w = int(float(self.ed_w.text() or "0"))
-            h = int(float(self.ed_h.text() or "0"))
-            x = int(float(self.ed_x.text() or "0"))
-            y = int(float(self.ed_y.text() or "0"))
-            saved_roi = (w, h, x, y)
-        except Exception:
-            saved_roi = (0, 0, 0, 0)
+        # Pause main-window live preview to reduce UI load while viewer is open
+        if not self._video_paused:
+            try:
+                self.ctrl.cam.frame.disconnect(self._on_frame)
+                self._video_paused = True
+                print("[MainWindow] Live preview paused for Spot Viewer.")
+            except Exception:
+                pass
 
+        # snapshot current ROI & FPS so the viewer can restore exactly
+        W, H = self._roi_size
+        X, Y = self._roi_offset
         try:
-            saved_fps = float(self.ed_fps.text()) if self.ed_fps.text().strip() else None
+            fps_saved = float(self.ed_fps.text()) if self.ed_fps.text().strip() else None
         except Exception:
-            saved_fps = None
+            fps_saved = None
 
-        from polarcam.app.spot_viewer import SpotViewerDialog
-        dlg = SpotViewerDialog(self.ctrl, sel_spots, self, saved_roi=saved_roi, saved_fps=saved_fps)
+        dlg = SpotViewerDialog(self.ctrl, sel_spots, self, saved_roi=(W, H, X, Y), saved_fps=fps_saved)
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        dlg.destroyed.connect(self._resume_main_video)  # resume when the dialog closes
         dlg.show()
 
     def _remove_selected_spots(self) -> None:
-        idxs = set(self._selected_spot_indices())
+        idxs = self._selected_spot_indices()
         if not idxs:
             return
-        self._spots = [s for i, s in enumerate(self._spots) if i not in idxs]
+        keep = [s for i, s in enumerate(self._spots) if i not in idxs]
+        self._spots = keep
         self._refresh_spot_list()
 
-    # ------------------------------------------
-    # UI → controller
-    # ------------------------------------------
+    # ---------- CYCLE: start/stop threads ----------
+    def _start_cycle_clicked(self) -> None:
+        if not self._spots:
+            QMessageBox.information(self, "Cycle", "No spots selected/detected."); return
+
+        # Record to ./cycles by default
+        out_dir = os.path.join(os.getcwd(), "cycles")
+        cfg = CycleConfig(
+            out_dir=out_dir,
+            base_name="cycle",
+            dwell_sec=1.0,             # 1 s per spot (as requested)
+            max_duration_sec=3600,     # guard: up to 1 hour
+            chunk_len=20000,           # flush often to avoid RAM growth
+            maximize_camera_fps=True,  # record at max FPS possible
+        )
+
+        if self._cycle_thread is not None:
+            QMessageBox.information(self, "Cycle", "Cycler already running."); return
+
+        self._cycle_thread = QThread(self)
+        self._cycler = MultiSpotCycler(self.ctrl.cam, self._spots, cfg)
+        self._cycler.moveToThread(self._cycle_thread)
+
+        self._cycle_thread.started.connect(self._cycler.start)
+        self._cycler.progress.connect(lambda s: self.status.showMessage(s, 1200))
+        self._cycler.error.connect(lambda e: self.status.showMessage(f"Cycle error: {e}", 5000))
+        self._cycler.stopped.connect(self._cycle_thread.quit)
+        self._cycle_thread.finished.connect(self._cycle_finished)
+
+        # Enable preview throttle (cap to ~20 fps) while recording at max FPS
+        self._cycle_active = True
+        self._last_preview_t = 0.0
+
+        self._cycle_thread.start()
+        self.btn_cycle_start.setEnabled(False)
+        self.btn_cycle_stop.setEnabled(True)
+        self.status.showMessage("Cycle started — recording at max FPS, preview capped at 20 FPS.", 4000)
+
+    def _stop_cycle_clicked(self) -> None:
+        # User stop
+        if self._cycler:
+            try: self._cycler.stop()
+            except Exception: pass
+        if self._cycle_thread:
+            self._cycle_thread.wait(3000)  # join
+
+    def _cycle_finished(self) -> None:
+        # Thread finished
+        self._cycler = None
+        self._cycle_thread = None
+        self.btn_cycle_start.setEnabled(True)
+        self.btn_cycle_stop.setEnabled(False)
+        self._cycle_active = False
+        self.status.showMessage("Cycle stopped.", 2500)
+
+    # ---------- UI handlers (UI → controller) ----------
     def _open_clicked(self) -> None:
-        if hasattr(self.ctrl, "open"):
-            self.ctrl.open()
+        if hasattr(self.ctrl, "open"): self.ctrl.open()
 
     def _start_clicked(self) -> None:
-        if self.btn_start.isEnabled() and hasattr(self.ctrl, "start"):
-            self.ctrl.start()
+        if self.btn_start.isEnabled() and hasattr(self.ctrl, "start"): self.ctrl.start()
 
     def _stop_clicked(self) -> None:
-        if self.btn_stop.isEnabled() and hasattr(self.ctrl, "stop"):
-            self.ctrl.stop()
+        if self.btn_stop.isEnabled() and hasattr(self.ctrl, "stop"): self.ctrl.stop()
 
     def _close_clicked(self) -> None:
-        if self.btn_close.isEnabled() and hasattr(self.ctrl, "close"):
-            self.ctrl.close()
+        if self.btn_close.isEnabled() and hasattr(self.ctrl, "close"): self.ctrl.close()
 
     def _apply_roi(self) -> None:
         try:
@@ -705,17 +646,13 @@ class MainWindow(QMainWindow):
             x = int(float(self.ed_x.text() or "0"))
             y = int(float(self.ed_y.text() or "0"))
         except Exception:
-            self.status.showMessage("ROI: invalid numbers", 2000)
-            return
+            self.status.showMessage("ROI: invalid numbers", 2000); return
         if w <= 0 or h <= 0:
-            self.status.showMessage("ROI: width/height must be > 0. Use Full sensor if unsure.", 3000)
-            return
-        if hasattr(self.ctrl, "set_roi"):
-            self.ctrl.set_roi(w, h, x, y)
+            self.status.showMessage("ROI: width/height must be > 0. Use Full sensor if unsure.", 3000); return
+        if hasattr(self.ctrl, "set_roi"): self.ctrl.set_roi(w, h, x, y)
 
     def _full_roi_clicked(self) -> None:
-        if hasattr(self.ctrl, "full_sensor"):
-            self.ctrl.full_sensor()
+        if hasattr(self.ctrl, "full_sensor"): self.ctrl.full_sensor()
 
     def _apply_timing(self) -> None:
         # exposure textbox is *milliseconds*
@@ -727,16 +664,13 @@ class MainWindow(QMainWindow):
     def _apply_gains(self) -> None:
         ana = float(self.ed_gain_ana.text()) if self.ed_gain_ana.text().strip() else None
         dig = float(self.ed_gain_dig.text()) if self.ed_gain_dig.text().strip() else None
-        if hasattr(self.ctrl, "set_gains"):
-            self.ctrl.set_gains(ana, dig)
+        if hasattr(self.ctrl, "set_gains"): self.ctrl.set_gains(ana, dig)
 
     def _refresh_gains(self) -> None:
         if hasattr(self.ctrl, "refresh_gains"):
-            self.ctrl.refresh_gains()
-            self.status.showMessage("Refreshing gains…", 800)
+            self.ctrl.refresh_gains(); self.status.showMessage("Refreshing gains…", 800)
         elif hasattr(self.ctrl, "cam") and hasattr(self.ctrl.cam, "refresh_gains"):
-            self.ctrl.cam.refresh_gains()
-            self.status.showMessage("Refreshing gains…", 800)
+            self.ctrl.cam.refresh_gains(); self.status.showMessage("Refreshing gains…", 800)
 
     def _desaturate_clicked(self) -> None:
         if hasattr(self.ctrl, "desaturate"):
@@ -750,25 +684,20 @@ class MainWindow(QMainWindow):
         exp_us = d.get("exposure_us", None)
         tgt = int(d.get("target", 0))
         if ok:
-            self.status.showMessage(
-                f"Desaturate done: iters={it}, max={mx}, target={tgt}, exposure={(exp_us or 0)/1000.0:.1f} ms", 3000
-            )
+            self.status.showMessage(f"Desaturate done: iters={it}, max={mx}, target={tgt}, exposure={(exp_us or 0)/1000.0:.1f} ms", 3000)
         else:
             QMessageBox.warning(
-                self,
-                "Desaturate",
+                self, "Desaturate",
                 f"Couldn’t reach target after {max(it, 5)} tries.\n"
-                f"Final max={mx}, target={tgt}, exposure={(exp_us or 0)/1000.0:.1f} ms",
+                f"Final max={mx}, target={tgt}, exposure={(exp_us or 0)/1000.0:.1f} ms"
             )
 
     def _on_desat_started(self) -> None:
-        if hasattr(self, "btn_desat"):
-            self.btn_desat.setEnabled(False)
+        if hasattr(self, "btn_desat"): self.btn_desat.setEnabled(False)
         self.status.showMessage("Auto-desaturating…", 2000)
 
     def _on_desat_finished(self) -> None:
-        if hasattr(self, "btn_desat"):
-            self.btn_desat.setEnabled(True)
+        if hasattr(self, "btn_desat"): self.btn_desat.setEnabled(True)
         self.status.showMessage("Auto-desaturate complete.", 1500)
 
     def _open_varmap(self) -> None:
@@ -796,18 +725,14 @@ class MainWindow(QMainWindow):
 
     def _varmap_alive(self) -> bool:
         vm = getattr(self, "_varmap", None)
-        if vm is None:
-            return False
-        try:
-            return vm.isVisible()
+        if vm is None: return False
+        try: return vm.isVisible()
         except RuntimeError:
-            self._varmap = None
-            return False
+            self._varmap = None; return False
 
     def _refresh_video_view(self) -> None:
         pm = getattr(self, "_last_pm", None)
-        if pm is None:
-            return
+        if pm is None: return
         self.video.setPixmap(pm.scaled(self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def resizeEvent(self, e) -> None:
@@ -817,25 +742,37 @@ class MainWindow(QMainWindow):
     # ---------- cleanup ----------
     def safe_shutdown(self) -> None:
         try:
-            if hasattr(self.ctrl, "stop"):
-                self.ctrl.stop()
+            # stop cycler if running
+            if self._cycler:
+                try: self._cycler.stop()
+                except Exception: pass
+            if self._cycle_thread:
+                self._cycle_thread.wait(2000)
         except Exception:
             pass
         try:
-            if hasattr(self.ctrl, "close"):
-                self.ctrl.close()
-        except Exception:
-            pass
+            if hasattr(self.ctrl, "stop"): self.ctrl.stop()
+        except Exception: pass
+        try:
+            if hasattr(self.ctrl, "close"): self.ctrl.close()
+        except Exception: pass
 
     def closeEvent(self, e) -> None:
+        try:
+            if self._cycler:
+                try: self._cycler.stop()
+                except Exception: pass
+            if self._cycle_thread:
+                self._cycle_thread.wait(2000)
+        except Exception:
+            pass
         try:
             if self.btn_stop.isEnabled() and hasattr(self.ctrl, "stop"):
                 self.ctrl.stop(); QApplication.processEvents()
         except Exception:
             pass
         try:
-            if hasattr(self.ctrl, "close"):
-                self.ctrl.close()
+            if hasattr(self.ctrl, "close"): self.ctrl.close()
         except Exception:
             pass
         super().closeEvent(e)

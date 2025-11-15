@@ -1,11 +1,12 @@
 # ------------------------------------------
 # IDS backend (ids_peak): robust worker thread
-# ROI + Timing + Gains mailboxes; buffer pool; Mono12 forcing.
+# ROI + Timing + Gains mailboxes; buffer pool; Mono12/RAW guard.
 # Emits uint16 frames (12-bit data in 0..4095).
 # ------------------------------------------
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 from threading import Event, Lock
 from time import sleep
@@ -13,6 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Signal, Slot, QMetaObject, Qt
+
+from .base import ICamera
+
+log = logging.getLogger(__name__)
 
 # ---- IDS imports (guarded so UI won’t explode if lib missing) ----
 try:
@@ -142,8 +147,10 @@ class _StreamWorker(QObject):
         mx = self._node_max(name)
         inc = self._node_inc(name)
         v = float(value)
-        if mn is not None: v = max(v, mn)
-        if mx is not None: v = min(v, mx)
+        if mn is not None:
+            v = max(v, mn)
+        if mx is not None:
+            v = min(v, mx)
         if inc and inc > 0:
             base = mn if mn is not None else 0.0
             steps = math.floor((v - base) / inc + 1e-9)
@@ -171,15 +178,19 @@ class _StreamWorker(QObject):
         required = max(required, 1)
 
         # pick FPS estimate
-        fps = None
+        fps: Optional[float] = None
         if desired_fps is not None:
-            try: fps = float(desired_fps)
-            except Exception: fps = None
+            try:
+                fps = float(desired_fps)
+            except Exception:
+                fps = None
         if fps is None:
             t = self._read_timing()
-            fps = (t.get("resulting_fps") or t.get("fps") or 30.0)
-            try: fps = float(fps)  # type: ignore[arg-type]
-            except Exception: fps = 30.0
+            fps = (t.get("resulting_fps") or t.get("fps") or 30.0)  # type: ignore[assignment]
+            try:
+                fps = float(fps)  # type: ignore[arg-type]
+            except Exception:
+                fps = 30.0
 
         payload = self._current_payload_bytes()
         window_count = int(max(1, round(float(fps) * BUFFER_WINDOW_SEC)))
@@ -194,12 +205,16 @@ class _StreamWorker(QObject):
         return target, required, payload
 
     def _clear_pool(self) -> None:
-        try: self._ds.Flush(ids.DataStreamFlushMode_DiscardAll)
-        except Exception: pass
+        try:
+            self._ds.Flush(ids.DataStreamFlushMode_DiscardAll)
+        except Exception:
+            pass
         try:
             for b in self._announced:
-                try: self._ds.RevokeBuffer(b)
-                except Exception: pass
+                try:
+                    self._ds.RevokeBuffer(b)
+                except Exception:
+                    pass
         except Exception:
             pass
         self._announced = []
@@ -219,31 +234,32 @@ class _StreamWorker(QObject):
             sleep(0.005)
             try:
                 mb = payload * len(self._announced)
-                print(f"[BufferPool] announced={len(self._announced)} required>={required} payload={payload} (~{mb/1048576:.1f} MiB)")
+                log.debug("BufferPool: announced=%d required>=%d payload=%d (~%.1f MiB)",
+                          len(self._announced), required, payload, mb / 1048576.0)
             except Exception:
                 pass
             return True
         except Exception as e:
             self.error.emit(f"Pool prepare failed: {e}")
-            print("[Worker] pool prepare failed:", e)
+            log.exception("Pool prepare failed")
             return False
 
     # ---------- pixel format ----------
     def _force_mono_format(self) -> None:
-        """Force grayscale output (prefer Mono12)."""
+        """Best-effort grayscale output (prefer Mono12/Mono16/Mono8)."""
         try:
-            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
-            print("[Worker] TLParamsLocked=0 for PixelFormat")
+            tln = self._nm.FindNode("TLParamsLocked")
+            tln and tln.SetValue(0)
+            log.debug("TLParamsLocked=0 for PixelFormat")
         except Exception:
             pass
         try:
             pf = self._nm.FindNode("PixelFormat")
             if pf and hasattr(pf, "SetCurrentEntry"):
-                # Try your preferred ordering
                 for cand in ("Mono12", "Mono16", "Mono8", "Mono12p"):
                     try:
                         pf.SetCurrentEntry(cand)
-                        print(f"[Worker] PixelFormat -> {cand}")
+                        log.info("PixelFormat -> %s", cand)
                         break
                     except Exception:
                         continue
@@ -251,8 +267,174 @@ class _StreamWorker(QObject):
             pass
         finally:
             try:
-                tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(1)
-                print("[Worker] TLParamsLocked=1 after PixelFormat")
+                tln = self._nm.FindNode("TLParamsLocked")
+                tln and tln.SetValue(1)
+                log.debug("TLParamsLocked=1 after PixelFormat")
+            except Exception:
+                pass
+
+    # ---------- format guard (RAW + Mono12) ----------
+    def _enum_symbol(self, node) -> Optional[str]:
+        """Best-effort readback of the current enum symbolic name."""
+        try:
+            ce = getattr(node, "CurrentEntry", None)
+            if callable(ce):
+                ent = ce()
+                for attr in ("SymbolicValue", "GetSymbolic", "Symbolic", "GetSymbolicValue"):
+                    fn = getattr(ent, attr, None)
+                    if callable(fn):
+                        try:
+                            val = fn()
+                            if isinstance(val, str):
+                                return val
+                        except Exception:
+                            pass
+                for attr in ("DisplayName", "GetDisplayName"):
+                    fn = getattr(ent, attr, None)
+                    if callable(fn):
+                        try:
+                            val = fn()
+                            if isinstance(val, str):
+                                return val
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return None
+
+    def _set_enum_symbol(self, node_name: str, symbolic: str) -> bool:
+        n = self._nm.FindNode(node_name)
+        if n is None:
+            return False
+        try:
+            if hasattr(n, "SetCurrentEntry"):
+                n.SetCurrentEntry(symbolic)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _node_bool(self, name: str) -> Optional[bool]:
+        n = self._get_node(name)
+        if n is None:
+            return None
+        for attr in ("Value", "GetValue"):
+            try:
+                return bool(getattr(n, attr)())
+            except Exception:
+                pass
+        # Sometimes exposed as enum "True"/"False"
+        try:
+            sym = self._enum_symbol(n)
+            if isinstance(sym, str):
+                s = sym.strip().lower()
+                if s in ("true", "1"):
+                    return True
+                if s in ("false", "0"):
+                    return False
+        except Exception:
+            pass
+        return None
+
+    @Slot()
+    def force_raw_mono12(self) -> None:
+        """Enforce Component=Raw + PixelFormat=Mono12 when NOT acquiring.
+        Skips writes if already correct (avoid BAD_ACCESS on read-only nodes)."""
+        if getattr(self, "_run", None) and self._run.is_set():
+            self.error.emit("Format change requires camera to be stopped.")
+            return
+
+        log.info("FormatGuard: enforce Component=Raw + Mono12")
+
+        # Unlock while we touch format nodes
+        tln = None
+        try:
+            tln = self._nm.FindNode("TLParamsLocked")
+            tln and tln.SetValue(0)
+            log.debug("TLParamsLocked=0 for format guard")
+        except Exception:
+            pass
+
+        try:
+            sel = self._get_node("ComponentSelector")
+            pf  = self._get_node("PixelFormat")
+            if sel is None:
+                self.error.emit("ComponentSelector node not found.")
+                return
+            if pf is None:
+                self.error.emit("PixelFormat node not found.")
+                return
+
+            curr_comp = (self._enum_symbol(sel) or "").lower()
+            en_val    = self._node_bool("ComponentEnable")
+            pf_sym    = (self._enum_symbol(pf) or "").lower()
+
+            # Fast path
+            if curr_comp == "raw" and pf_sym.startswith("mono12"):
+                log.info("FormatGuard: already RAW + Mono12; nothing to do.")
+                return
+
+            # 1) Select RAW
+            if curr_comp != "raw":
+                ok = False
+                for cand in ("Raw", "RAW", "raw"):
+                    if self._set_enum_symbol("ComponentSelector", cand):
+                        new_sym = (self._enum_symbol(sel) or "").lower()
+                        if new_sym == "raw":
+                            ok = True
+                            break
+                if not ok:
+                    self.error.emit("Could not set ComponentSelector to 'Raw'.")
+                    return
+                en_val = self._node_bool("ComponentEnable")  # refresh
+
+            # 2) Ensure RAW component enabled (only write if needed)
+            en_node = self._get_node("ComponentEnable")
+            if en_node is not None:
+                if en_val is not True:
+                    try:
+                        en_node.SetValue(True)
+                        log.info("FormatGuard: ComponentEnable -> True")
+                    except Exception as e:
+                        reread = self._node_bool("ComponentEnable")
+                        if reread is True:
+                            log.info("FormatGuard: ComponentEnable already active (read-only).")
+                        else:
+                            self.error.emit(f"Could not enable RAW component: {e}")
+                            return
+            else:
+                log.debug("FormatGuard: ComponentEnable node not present; continuing.")
+
+            # 3) Set PixelFormat to Mono12 (strict, tolerate already-Mono12)
+            if not pf_sym.startswith("mono12"):
+                try:
+                    pf.SetCurrentEntry("Mono12")
+                    log.info("PixelFormat -> Mono12")
+                except Exception as e_pf:
+                    pf_sym2 = (self._enum_symbol(pf) or "").lower()
+                    if pf_sym2.startswith("mono12"):
+                        log.info("FormatGuard: PixelFormat already Mono12.")
+                    else:
+                        for fb in ("Mono12p", "Mono12Packed"):
+                            try:
+                                pf.SetCurrentEntry(fb)
+                                log.info("PixelFormat -> %s", fb)
+                                break
+                            except Exception:
+                                continue
+                        else:
+                            self.error.emit(f"Could not set PixelFormat to Mono12: {e_pf}")
+                            return
+
+            log.info("FormatGuard: RAW + Mono12 enforced.")
+            # Keep GUI in sync
+            self.query_roi()
+            self.query_timing()
+
+        finally:
+            try:
+                tln and tln.SetValue(1)
+                log.debug("TLParamsLocked=1 after format guard")
             except Exception:
                 pass
 
@@ -271,10 +453,13 @@ class _StreamWorker(QObject):
         try:
             sz = img.Size()
             w = getattr(sz, "width", None); h = getattr(sz, "height", None)
-            if w is not None and h is not None: return int(w), int(h)
+            if w is not None and h is not None:
+                return int(w), int(h)
             W = getattr(sz, "Width", None); H = getattr(sz, "Height", None)
-            if callable(W) and callable(H): return int(W()), int(H())
-            if W is not None and H is not None: return int(W), int(H)
+            if callable(W) and callable(H):
+                return int(W()), int(H())
+            if W is not None and H is not None:
+                return int(W), int(H)
         except Exception:
             pass
         raise RuntimeError("Cannot obtain image size from IDS IPL image")
@@ -283,23 +468,29 @@ class _StreamWorker(QObject):
         try:
             w = float(d.get("Width")); h = float(d.get("Height"))
             x = float(d.get("OffsetX")); y = float(d.get("OffsetY"))
-            print(f"[Worker] apply_roi while_running={while_running}: W={w} H={h} X={x} Y={y}")
+            log.debug("apply_roi while_running=%s: W=%s H=%s X=%s Y=%s",
+                      while_running, w, h, x, y)
         except Exception as e:
             self.error.emit(f"ROI args invalid: {e}")
             return
 
         # pause if needed
         if while_running:
-            try: self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception: pass
-            try: self._ds.StopAcquisition()
-            except Exception: pass
+            try:
+                self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception:
+                pass
+            try:
+                self._ds.StopAcquisition()
+            except Exception:
+                pass
             self._clear_pool()
 
         # unlock
         try:
-            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
-            print("[Worker] TLParamsLocked=0 for ROI")
+            tln = self._nm.FindNode("TLParamsLocked")
+            tln and tln.SetValue(0)
+            log.debug("TLParamsLocked=0 for ROI")
         except Exception:
             pass
 
@@ -309,7 +500,7 @@ class _StreamWorker(QObject):
             hv = int(round(self._snap("Height", h)))
             self._nm.FindNode("Width").SetValue(wv)
             self._nm.FindNode("Height").SetValue(hv)
-            print(f"[Worker] ROI size -> Width={wv} Height={hv}")
+            log.info("ROI size -> Width=%d Height=%d", wv, hv)
         except Exception as e:
             self.error.emit(f"ROI width/height failed: {e}")
             return
@@ -319,11 +510,13 @@ class _StreamWorker(QObject):
             xv = int(round(self._snap("OffsetX", x)))
             yv = int(round(self._snap("OffsetY", y)))
             mx_x = self._node_max("OffsetX"); mx_y = self._node_max("OffsetY")
-            if mx_x is not None: xv = min(xv, int(round(mx_x)))
-            if mx_y is not None: yv = min(yv, int(round(mx_y)))
+            if mx_x is not None:
+                xv = min(xv, int(round(mx_x)))
+            if mx_y is not None:
+                yv = min(yv, int(round(mx_y)))
             self._nm.FindNode("OffsetX").SetValue(xv)
             self._nm.FindNode("OffsetY").SetValue(yv)
-            print(f"[Worker] ROI offsets -> X={xv} Y={yv}")
+            log.info("ROI offsets -> X=%d Y=%d", xv, yv)
         except Exception as e:
             self.error.emit(f"ROI offsets failed: {e}")
             return
@@ -332,8 +525,9 @@ class _StreamWorker(QObject):
         self._force_mono_format()
         self._announce_and_queue(desired_fps=None)
         try:
-            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(1)
-            print("[Worker] TLParamsLocked=1 after ROI")
+            tln = self._nm.FindNode("TLParamsLocked")
+            tln and tln.SetValue(1)
+            log.debug("TLParamsLocked=1 after ROI")
         except Exception:
             pass
 
@@ -342,7 +536,7 @@ class _StreamWorker(QObject):
             try:
                 self._ds.StartAcquisition()
                 self._nm.FindNode("AcquisitionStart").Execute()
-                print("[Worker] resumed acquisition after ROI")
+                log.debug("resumed acquisition after ROI")
             except Exception as e:
                 self.error.emit(f"ROI resume failed: {e}")
 
@@ -351,14 +545,19 @@ class _StreamWorker(QObject):
 
     def _apply_full_sensor(self, while_running: bool) -> None:
         if while_running:
-            try: self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception: pass
-            try: self._ds.StopAcquisition()
-            except Exception: pass
+            try:
+                self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception:
+                pass
+            try:
+                self._ds.StopAcquisition()
+            except Exception:
+                pass
             self._clear_pool()
 
         try:
-            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
+            tln = self._nm.FindNode("TLParamsLocked")
+            tln and tln.SetValue(0)
             # reset offsets to minima
             for key in ("OffsetX", "OffsetY"):
                 mn = self._node_min(key)
@@ -366,8 +565,10 @@ class _StreamWorker(QObject):
                     self._nm.FindNode(key).SetValue(int(round(mn)))
             # set max size
             wmx = self._node_max("Width"); hmx = self._node_max("Height")
-            if wmx is not None: self._nm.FindNode("Width").SetValue(int(round(wmx)))
-            if hmx is not None: self._nm.FindNode("Height").SetValue(int(round(hmx)))
+            if wmx is not None:
+                self._nm.FindNode("Width").SetValue(int(round(wmx)))
+            if hmx is not None:
+                self._nm.FindNode("Height").SetValue(int(round(hmx)))
             tln and tln.SetValue(1)
         except Exception as e:
             self.error.emit(f"Full sensor failed: {e}")
@@ -380,7 +581,7 @@ class _StreamWorker(QObject):
             try:
                 self._ds.StartAcquisition()
                 self._nm.FindNode("AcquisitionStart").Execute()
-                print("[Worker] resumed acquisition after ROI(full)")
+                log.debug("resumed acquisition after ROI(full)")
             except Exception as e:
                 self.error.emit(f"ROI resume failed: {e}")
 
@@ -406,7 +607,8 @@ class _StreamWorker(QObject):
         else:
             d["fps"] = d["fps_min"] = d["fps_max"] = d["fps_inc"] = None
         rf = self._node_value("ResultingFrameRate")
-        if rf is not None: d["resulting_fps"] = rf
+        if rf is not None:
+            d["resulting_fps"] = rf
         d["exposure_us"]  = self._node_value("ExposureTime")
         d["exposure_min"] = self._node_min("ExposureTime")
         d["exposure_max"] = self._node_max("ExposureTime")
@@ -414,33 +616,39 @@ class _StreamWorker(QObject):
         return d
 
     def _apply_timing_payload(self, d: Dict[str, Any], while_running: bool) -> None:
-        print(f"[Worker] apply_timing while_running={while_running}: {d}")
+        log.debug("apply_timing while_running=%s: %s", while_running, d)
         fps_req = d.get("fps")
         exp_ms_req = d.get("exposure_ms")
 
         def _unlock():
             try:
-                tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
-                print("[Worker] TLParamsLocked=0 for timing")
+                tln = self._nm.FindNode("TLParamsLocked")
+                tln and tln.SetValue(0)
+                log.debug("TLParamsLocked=0 for timing")
             except Exception:
                 pass
 
         def _pause():
-            try: self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception: pass
-            try: self._ds.StopAcquisition()
-            except Exception: pass
+            try:
+                self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception:
+                pass
+            try:
+                self._ds.StopAcquisition()
+            except Exception:
+                pass
 
         def _resume():
             try:
                 self._ds.StartAcquisition()
                 self._nm.FindNode("AcquisitionStart").Execute()
-                print("[Worker] resumed acquisition after timing")
+                log.debug("resumed acquisition after timing")
             except Exception as e:
                 self.error.emit(f"Timing resume failed: {e}")
 
         def _rebuild_pool(desired_fps: Optional[float] = None):
-            if self._announce_and_queue(desired_fps): print("[Worker] buffer pool rebuilt for timing")
+            if self._announce_and_queue(desired_fps):
+                log.debug("buffer pool rebuilt for timing")
 
         _unlock()
         paused = False
@@ -452,16 +660,18 @@ class _StreamWorker(QObject):
             try:
                 auto = self._get_node("ExposureAuto")
                 if auto and hasattr(auto, "SetCurrentEntry"):
-                    try: auto.SetCurrentEntry("Off")
-                    except Exception: pass
+                    try:
+                        auto.SetCurrentEntry("Off")
+                    except Exception:
+                        pass
                 self._get_node("ExposureTime").SetValue(exp_us)
-                print(f"[Worker] set Exposure -> {exp_us} us")
+                log.info("Exposure -> %.1f us", exp_us)
             except Exception as e:
                 if while_running and not paused:
                     _pause(); paused = True
                     try:
                         self._get_node("ExposureTime").SetValue(exp_us)
-                        print(f"[Worker] set Exposure (paused) -> {exp_us} us")
+                        log.info("Exposure (paused) -> %.1f us", exp_us)
                     except Exception as e2:
                         self.error.emit(f"Set Exposure failed: {e2}")
 
@@ -471,26 +681,31 @@ class _StreamWorker(QObject):
             try:
                 en = self._get_node("AcquisitionFrameRateEnable")
                 if en is not None:
-                    try: en.SetValue(True)
-                    except Exception: pass
+                    try:
+                        en.SetValue(True)
+                    except Exception:
+                        pass
                 self._get_node("AcquisitionFrameRate").SetValue(fps_snapped)
-                print(f"[Worker] set FPS -> {fps_snapped}")
+                log.info("FrameRate -> %.3f", fps_snapped)
             except Exception as e:
                 if while_running and not paused:
                     _pause(); paused = True
                     try:
                         self._get_node("AcquisitionFrameRate").SetValue(fps_snapped)
-                        print(f"[Worker] set FPS (paused) -> {fps_snapped}")
+                        log.info("FrameRate (paused) -> %.3f", fps_snapped)
                     except Exception as e2:
                         self.error.emit(f"Set FPS failed: {e2}")
 
-        if exp_ms_req is not None: _set_exposure(exp_ms_req)
-        if fps_req is not None:    _set_fps(fps_req)
+        if exp_ms_req is not None:
+            _set_exposure(exp_ms_req)
+        if fps_req is not None:
+            _set_fps(fps_req)
 
         # relock + maybe rebuild + resume
         try:
-            tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(1)
-            print("[Worker] TLParamsLocked=1 after timing")
+            tln = self._nm.FindNode("TLParamsLocked")
+            tln and tln.SetValue(1)
+            log.debug("TLParamsLocked=1 after timing")
         except Exception:
             pass
         if paused and while_running:
@@ -508,8 +723,10 @@ class _StreamWorker(QObject):
             try:
                 sel = self._get_node("GainSelector")
                 if sel and hasattr(sel, "SetCurrentEntry"):
-                    try: sel.SetCurrentEntry("AnalogAll")
-                    except Exception: pass
+                    try:
+                        sel.SetCurrentEntry("AnalogAll")
+                    except Exception:
+                        pass
                 out["analog"]["val"] = self._node_value("Gain")
                 out["analog"]["min"] = self._node_min("Gain")
                 out["analog"]["max"] = self._node_max("Gain")
@@ -520,8 +737,10 @@ class _StreamWorker(QObject):
             try:
                 sel = self._get_node("GainSelector")
                 if sel and hasattr(sel, "SetCurrentEntry"):
-                    try: sel.SetCurrentEntry("DigitalAll")
-                    except Exception: pass
+                    try:
+                        sel.SetCurrentEntry("DigitalAll")
+                    except Exception:
+                        pass
                 out["digital"]["val"] = self._node_value("Gain")
                 out["digital"]["min"] = self._node_min("Gain")
                 out["digital"]["max"] = self._node_max("Gain")
@@ -534,41 +753,50 @@ class _StreamWorker(QObject):
         return out
 
     def _apply_gains_payload(self, d: Dict[str, Any], while_running: bool) -> None:
-        print(f"[Worker] apply_gains while_running={while_running}: {d}")
+        log.debug("apply_gains while_running=%s: %s", while_running, d)
 
         def _pause():
-            try: self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception: pass
-            try: self._ds.StopAcquisition()
-            except Exception: pass
+            try:
+                self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception:
+                pass
+            try:
+                self._ds.StopAcquisition()
+            except Exception:
+                pass
 
         def _resume():
             try:
                 self._ds.StartAcquisition()
                 self._nm.FindNode("AcquisitionStart").Execute()
-                print("[Worker] resumed acquisition after gains")
+                log.debug("resumed acquisition after gains")
             except Exception as e:
                 self.error.emit(f"Gains resume failed: {e}")
 
         paused = False
-        if while_running: _pause(); paused = True
+        if while_running:
+            _pause(); paused = True
 
         def _set_gain(sel_name: str, val: float):
             try:
                 sel = self._get_node("GainSelector")
                 if sel and hasattr(sel, "SetCurrentEntry"):
-                    try: sel.SetCurrentEntry(sel_name)
-                    except Exception: pass
+                    try:
+                        sel.SetCurrentEntry(sel_name)
+                    except Exception:
+                        pass
                 v = float(val)
                 mn, mx, inc = self._node_min("Gain"), self._node_max("Gain"), self._node_inc("Gain")
-                if mn is not None: v = max(v, mn)
-                if mx is not None: v = min(v, mx)
+                if mn is not None:
+                    v = max(v, mn)
+                if mx is not None:
+                    v = min(v, mx)
                 if inc and inc > 0:
                     base = mn if mn is not None else 0.0
                     steps = math.floor((v - base) / inc + 1e-9)
                     v = base + steps * inc
                 self._get_node("Gain").SetValue(v)
-                print(f"[Worker] set {sel_name} Gain -> {v}")
+                log.info("%s Gain -> %.3f", sel_name, v)
             except Exception as e:
                 self.error.emit(f"Set {sel_name} Gain failed: {e}")
 
@@ -580,7 +808,7 @@ class _StreamWorker(QObject):
         if paused and while_running:
             self._force_mono_format()
             if self._announce_and_queue(desired_fps=None):
-                print("[Worker] buffer pool rebuilt for gains")
+                log.debug("buffer pool rebuilt for gains")
             _resume()
 
         self.gains.emit(self._read_gains())
@@ -591,7 +819,7 @@ class _StreamWorker(QObject):
         if self._closed or self._run.is_set():
             return
         try:
-            print("[Worker] start requested")
+            log.debug("worker: start requested")
             self._force_mono_format()
             if not self._announce_and_queue(desired_fps=None):
                 self.error.emit("Start failed: buffer pool not ready")
@@ -604,7 +832,7 @@ class _StreamWorker(QObject):
             self._nm.FindNode("AcquisitionStart").Execute()
             self._run.set()
             self.started.emit()
-            print("[Worker] started acquisition")
+            log.info("worker: started acquisition")
 
             while self._run.is_set():
                 # auto-desaturate request
@@ -614,7 +842,7 @@ class _StreamWorker(QObject):
                 if p is not None:
                     self._run_auto_desat(*p)
                     continue
-                # apply any pending mailbox updates (one per loop for fairness)
+                # apply any pending mailbox updates (one per loop)
                 pending_roi = self._pop_pending_roi()
                 if pending_roi is not None:
                     if pending_roi.get("__full__"):
@@ -672,38 +900,45 @@ class _StreamWorker(QObject):
                     self.error.emit(f"Convert failed: {e}")
                 finally:
                     if buf is not None:
-                        try: self._ds.QueueBuffer(buf)
-                        except Exception: pass
+                        try:
+                            self._ds.QueueBuffer(buf)
+                        except Exception:
+                            pass
 
             # graceful stop
-            print("[Worker] finalize stop begin")
-            try: self._nm.FindNode("AcquisitionStop").Execute()
-            except Exception: pass
-            try: self._ds.StopAcquisition()
-            except Exception: pass
+            log.debug("worker: finalize stop begin")
+            try:
+                self._nm.FindNode("AcquisitionStop").Execute()
+            except Exception:
+                pass
+            try:
+                self._ds.StopAcquisition()
+            except Exception:
+                pass
             self._clear_pool()
             try:
                 n = self._nm.FindNode("TLParamsLocked"); n and n.SetValue(0)
             except Exception:
                 pass
-            print("[Worker] finalize stop done")
+            log.debug("worker: finalize stop done")
             self.stopped.emit()
         except Exception as e:
             self.error.emit(f"Start failed: {e}")
-            print("[Worker] start exception:", e)
+            log.exception("worker: start exception")
 
     @Slot()
     def set_stop_flag(self) -> None:
-        print("[Worker] set_stop_flag — clearing run flag")
+        log.debug("worker: set_stop_flag")
         self._run.clear()
 
     @Slot()
     def request_stop(self) -> None:
-        print("[Worker] request_stop — trying CancelWait")
+        log.debug("worker: request_stop (CancelWait)")
         self._run.clear()
         try:
             cancel = getattr(self._ds, "CancelWait", None)
-            if callable(cancel): cancel()
+            if callable(cancel):
+                cancel()
         except Exception:
             pass
 
@@ -723,12 +958,12 @@ class _StreamWorker(QObject):
         out: Dict[str, Optional[float]] = {}
         for n in names:
             out[n] = self._node_value(n)
-        print(f"[Worker] ROI snapshot -> {out}")
+        log.debug("ROI snapshot -> %s", out)
         self.roi.emit(out)
 
     @Slot(object)
     def enqueue_roi(self, roi: object) -> None:
-        print(f"[Worker] enqueue_roi <- {roi}")
+        log.debug("enqueue_roi <- %s", roi)
         if not isinstance(roi, dict):
             return
         with self._roi_lock:
@@ -738,12 +973,12 @@ class _StreamWorker(QObject):
     @Slot()
     def query_timing(self) -> None:
         d = self._read_timing()
-        print(f"[Worker] timing -> {d}")
+        log.debug("timing -> %s", d)
         self.timing.emit(d)
 
     @Slot(object)
     def enqueue_timing(self, timing: object) -> None:
-        print(f"[Worker] enqueue_timing <- {timing}")
+        log.debug("enqueue_timing <- %s", timing)
         if not isinstance(timing, dict):
             return
         with self._tim_lock:
@@ -761,12 +996,12 @@ class _StreamWorker(QObject):
     @Slot()
     def query_gains(self) -> None:
         g = self._read_gains()
-        print(f"[Worker] gains -> {g}")
+        log.debug("gains -> %s", g)
         self.gains.emit(g)
 
     @Slot(object)
     def enqueue_gains(self, gains: object) -> None:
-        print(f"[Worker] enqueue_gains <- {gains}")
+        log.debug("enqueue_gains <- %s", gains)
         if not isinstance(gains, dict):
             return
         with self._gain_lock:
@@ -785,13 +1020,12 @@ class _StreamWorker(QObject):
 
     @Slot(float, int)
     def enqueue_auto_desat(self, target_frac: float, max_iters: int) -> None:
-        print(f"[Worker] enqueue_auto_desat <- target={target_frac}, max_iters={max_iters}")
+        log.debug("enqueue_auto_desat <- target=%s, max_iters=%s", target_frac, max_iters)
         if self._desat_busy:
-            print("[AutoDesat] already running; ignoring request")
+            log.debug("AutoDesat already running; ignoring")
             return
         self._desat_busy = True
         self.auto_desat_started.emit()
-        # Run immediately inside the worker thread (we’re already in it)
         try:
             self._run_auto_desat(target_frac, max_iters)
         finally:
@@ -822,20 +1056,25 @@ class _StreamWorker(QObject):
                 arr = arr.astype(np.uint16, copy=False)
             v = arr.ravel()
             pmax = int(v.max())
-            # robust percentile (avoid hot single pixels)
             p = np.partition(v, int(0.999 * (v.size - 1)))[int(0.999 * (v.size - 1))]
             p999 = int(p)
             return pmax, p999
         finally:
             if buf is not None:
-                try: self._ds.QueueBuffer(buf)
-                except Exception: pass
+                try:
+                    self._ds.QueueBuffer(buf)
+                except Exception:
+                    pass
 
     def _pause_stream(self):
-        try: self._nm.FindNode("AcquisitionStop").Execute()
-        except Exception: pass
-        try: self._ds.StopAcquisition()
-        except Exception: pass
+        try:
+            self._nm.FindNode("AcquisitionStop").Execute()
+        except Exception:
+            pass
+        try:
+            self._ds.StopAcquisition()
+        except Exception:
+            pass
 
     def _resume_stream(self):
         try:
@@ -849,27 +1088,26 @@ class _StreamWorker(QObject):
         target_dn = int(round(4095.0 * target_frac))
         iters = max(1, int(max_iters))
 
-        print(f"[AutoDesat] begin: target={target_dn} (~{target_frac*100:.1f}% FS) max_iters={iters}")
+        log.info("AutoDesat: target=%d (~%.1f%% FS) steps=%d", target_dn, target_frac * 100.0, iters)
 
         for i in range(1, iters + 1):
             stats = self._sample_stats(timeout_ms=200)
             if stats is None:
-                print(f"[AutoDesat] iter {i}/{iters}: no frame (timeout); retrying…")
+                log.debug("AutoDesat: iter %d/%d: no frame (timeout); retrying…", i, iters)
                 continue
             pmax, p999 = stats
-            peak_for_ctrl = p999 if pmax > target_dn * 1.30 else pmax  # robust until near target
+            peak_for_ctrl = p999 if pmax > target_dn * 1.30 else pmax
             cur_exp = float(self._node_value("ExposureTime") or 10000.0)
-            print(f"[AutoDesat] iter {i}/{iters}: pMax={pmax} p99.9={p999} target={target_dn} exp={cur_exp:.1f}us")
+            log.debug("AutoDesat: iter %d/%d: pMax=%d p99.9=%d target=%d exp=%.1fus",
+                      i, iters, pmax, p999, target_dn, cur_exp)
 
             if peak_for_ctrl <= target_dn:
-                print(f"[AutoDesat] done in {i} step(s): metric={peak_for_ctrl} ≤ target={target_dn}")
+                log.info("AutoDesat: done in %d step(s); metric=%d ≤ target=%d", i, peak_for_ctrl, target_dn)
                 break
 
-            # Compute new exposure from the chosen metric
             factor = max(0.05, min(1.0, (target_dn / max(1.0, float(peak_for_ctrl))) * 0.92))
             new_exp = self._snap("ExposureTime", cur_exp * factor)
 
-            # Hard apply with pause → set → rebuild → resume to ensure effect on next frame
             self._pause_stream()
             try:
                 tln = self._nm.FindNode("TLParamsLocked"); tln and tln.SetValue(0)
@@ -877,7 +1115,7 @@ class _StreamWorker(QObject):
                 pass
             try:
                 self._get_node("ExposureTime").SetValue(new_exp)
-                print(f"[AutoDesat] iter {i}: set Exposure -> {new_exp:.1f} us (factor={factor:.3f})")
+                log.info("AutoDesat: Exposure -> %.1f us (factor=%.3f)", new_exp, factor)
             except Exception as e:
                 self.error.emit(f"AutoDesat: set Exposure failed: {e}")
             finally:
@@ -886,27 +1124,23 @@ class _StreamWorker(QObject):
                 except Exception:
                     pass
 
-            # Rebuild buffers to kill any in-flight old frames
             self._announce_and_queue(desired_fps=None)
             self._resume_stream()
 
-            # small settle (~3 frames)
             rf = self._node_value("ResultingFrameRate") or self._node_value("AcquisitionFrameRate") or 30.0
             settle = max(0.06, 3.0 / float(rf))
             sleep(settle)
 
         else:
-            # final verification
             stats = self._sample_stats(timeout_ms=200)
             final = stats[0] if stats else None
             if (final is not None) and (final <= target_dn):
-                print(f"[AutoDesat] achieved after settle: peak={final} ≤ target={target_dn}")
+                log.info("AutoDesat: achieved after settle: peak=%d ≤ target=%d", final, target_dn)
             else:
-                msg = f"AutoDesat: max {iters} step(s) reached; peak still above target."
-                print("[AutoDesat] " + msg)
+                msg = "AutoDesat: max steps reached; peak still above target."
+                log.warning(msg)
                 self.error.emit(msg)
 
-        # keep GUI in sync
         self.query_timing()
 
     @Slot()
@@ -921,43 +1155,35 @@ class _StreamWorker(QObject):
     def close(self) -> None:
         if self._closed:
             return
-        print("[Worker] close requested")
+        log.debug("worker: close requested")
         self._run.clear()
-        try: self._nm.FindNode("AcquisitionStop").Execute()
-        except Exception: pass
-        try: self._ds.StopAcquisition()
-        except Exception: pass
+        try:
+            self._nm.FindNode("AcquisitionStop").Execute()
+        except Exception:
+            pass
+        try:
+            self._ds.StopAcquisition()
+        except Exception:
+            pass
         self._clear_pool()
         self._closed = True
-        print("[Worker] closed")
+        log.info("worker: closed")
         self.closed.emit()
 
 
 # ==================================================================
-# GUI-thread facade: IDSCamera
+# GUI-thread facade: IDSCamera (implements ICamera)
 # ==================================================================
-class IDSCamera(QObject):
+class IDSCamera(ICamera):
     """GUI-thread facade. All heavy lifting lives in _StreamWorker (QThread)."""
 
-    opened = Signal(str)
-    started = Signal()
-    stopped = Signal()
-    closed = Signal()
-    frame = Signal(object)   # uint16 image (12-bit data scaled to 0..4095)
-    error = Signal(str)
-    roi = Signal(dict)
-    timing = Signal(dict)
-    gains = Signal(dict)
-    desaturated = Signal(dict)
-
-    auto_desat_started = Signal()
-    auto_desat_finished = Signal()
+    # (Signals inherited from ICamera)
 
     # Mailbox bridges (GUI → worker)
     send_roi = Signal(object)
     send_timing = Signal(object)
     send_gains = Signal(object)
-    send_full = Signal() 
+    send_full = Signal()
     send_desat = Signal(float, int)
 
     def __init__(self) -> None:
@@ -975,7 +1201,6 @@ class IDSCamera(QObject):
         self.roi.connect(self._remember_roi)
 
     def _on_started(self) -> None:
-        """Worker says acquisition started; update state and bubble the signal up."""
         try:
             self._st.acquiring = True
         except Exception:
@@ -983,7 +1208,6 @@ class IDSCamera(QObject):
         self.started.emit()
 
     def _on_stopped(self) -> None:
-        """Worker says acquisition stopped; update state and bubble the signal up."""
         try:
             self._st.acquiring = False
         except Exception:
@@ -993,9 +1217,9 @@ class IDSCamera(QObject):
     # ---------- facade lifecycle ----------
     @Slot()
     def open(self) -> None:
-        print("[UI] open() called")
+        log.info("[UI] open()")
         if self._st.open:
-            print("[UI] open ignored: already open")
+            log.debug("[UI] open ignored: already open")
             return
         if _IDS_IMPORT_ERROR is not None:
             self.error.emit(f"ids_peak import failed: {_IDS_IMPORT_ERROR}")
@@ -1058,8 +1282,11 @@ class IDSCamera(QObject):
 
             self._st.open = True
             name = chosen.DisplayName() if hasattr(chosen, "DisplayName") else "IDS camera"
-            print("[UI] opened")
+            log.info("[UI] opened: %s", name)
             self.opened.emit(str(name))
+
+            # Enforce RAW+Mono12 once on open (idle)
+            self.force_raw_mono12()
 
             # initial snapshots
             QMetaObject.invokeMethod(self._worker, "query_roi", Qt.QueuedConnection)
@@ -1067,16 +1294,17 @@ class IDSCamera(QObject):
             QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
         except Exception as e:
             self.error.emit(f"Failed to open device: {e}")
+            log.exception("open() failed")
             self._cleanup_all()
 
     @Slot()
     def start(self) -> None:
-        print(f"[UI] start() called; acquiring={self._st.acquiring}")
+        log.info("[UI] start(); acquiring=%s", self._st.acquiring)
         if not self._st.open or not self._worker:
-            print("[UI] start ignored: not open or no worker")
+            log.debug("[UI] start ignored: not open or no worker")
             return
         if self._st.acquiring:
-            print("[UI] start ignored: already acquiring")
+            log.debug("[UI] start ignored: already acquiring")
             return
         QMetaObject.invokeMethod(self._worker, "start", Qt.QueuedConnection)
         QMetaObject.invokeMethod(self._worker, "query_timing", Qt.QueuedConnection)
@@ -1084,12 +1312,11 @@ class IDSCamera(QObject):
 
     @Slot()
     def stop(self) -> None:
-        print(f"[UI] stop() called; acquiring={self._st.acquiring}")
+        log.info("[UI] stop(); acquiring=%s", self._st.acquiring)
         if not self._worker:
-            print("[UI] stop ignored: no worker"); return
-        # Clear the run flag immediately so the worker loop exits
+            log.debug("[UI] stop ignored: no worker")
+            return
         QMetaObject.invokeMethod(self._worker, "set_stop_flag", Qt.DirectConnection)
-        # Also nudge any blocking wait
         QMetaObject.invokeMethod(self._worker, "request_stop", Qt.QueuedConnection)
 
     @Slot()
@@ -1108,8 +1335,9 @@ class IDSCamera(QObject):
     @Slot()
     def set_roi(self, w: float, h: float, x: float, y: float) -> None:
         if not self._worker:
-            print("[UI] set_roi ignored: no worker"); return
-        print(f"[UI] set_roi(w={w}, h={h}, x={x}, y={y}); acquiring={self._st.acquiring}")
+            log.debug("[UI] set_roi ignored: no worker")
+            return
+        log.info("[UI] set_roi(w=%s, h=%s, x=%s, y=%s)", w, h, x, y)
         payload = {"Width": w, "Height": h, "OffsetX": x, "OffsetY": y}
         self.send_roi.emit(payload)
         if not self._st.acquiring:
@@ -1120,24 +1348,29 @@ class IDSCamera(QObject):
     @Slot()
     def full_sensor(self) -> None:
         if not self._worker:
-            print("[UI] full_sensor ignored: no worker"); return
+            log.debug("[UI] full_sensor ignored: no worker")
+            return
         self.send_full.emit()
         if not self._st.acquiring:
-            # process immediately when idle
             QMetaObject.invokeMethod(self._worker, "process_pending_roi", Qt.QueuedConnection)
 
     @Slot()
     def set_timing(self, fps: Optional[float], exposure_ms: Optional[float]) -> None:
         if not self._worker:
-            print("[UI] set_timing ignored: no worker"); return
-        print(f"[UI] set_timing(fps={fps}, exposure_ms={exposure_ms}); acquiring={self._st.acquiring}")
+            log.debug("[UI] set_timing ignored: no worker")
+            return
+        log.info("[UI] set_timing(fps=%s, exposure_ms=%s)", fps, exposure_ms)
         payload: Dict[str, float] = {}
         if fps is not None:
-            try: payload["fps"] = float(fps)
-            except Exception: pass
+            try:
+                payload["fps"] = float(fps)
+            except Exception:
+                pass
         if exposure_ms is not None:
-            try: payload["exposure_ms"] = float(exposure_ms)
-            except Exception: pass
+            try:
+                payload["exposure_ms"] = float(exposure_ms)
+            except Exception:
+                pass
         self.send_timing.emit(payload)
         if not self._st.acquiring:
             QMetaObject.invokeMethod(self._worker, "process_pending_timing", Qt.QueuedConnection)
@@ -1145,39 +1378,40 @@ class IDSCamera(QObject):
     @Slot()
     def set_gains(self, analog: Optional[float], digital: Optional[float]) -> None:
         if not self._worker:
-            print("[UI] set_gains ignored: no worker"); return
-        print(f"[UI] set_gains(analog={analog}, digital={digital}); acquiring={self._st.acquiring}")
+            log.debug("[UI] set_gains ignored: no worker")
+            return
+        log.info("[UI] set_gains(analog=%s, digital=%s)", analog, digital)
         payload: Dict[str, Optional[float]] = {}
-        if analog is not None:  payload["analog"] = float(analog)
-        if digital is not None: payload["digital"] = float(digital)
+        if analog is not None:
+            payload["analog"] = float(analog)
+        if digital is not None:
+            payload["digital"] = float(digital)
         self.send_gains.emit(payload)
         if not self._st.acquiring:
             QMetaObject.invokeMethod(self._worker, "process_pending_gains", Qt.QueuedConnection)
 
     @Slot()
     def refresh_timing(self) -> None:
-        if not self._worker: return
+        if not self._worker:
+            return
         QMetaObject.invokeMethod(self._worker, "query_timing", Qt.QueuedConnection)
 
     @Slot()
     def refresh_gains(self) -> None:
         if not self._worker:
-            print("[UI] refresh_gains ignored: no worker"); return
+            log.debug("[UI] refresh_gains ignored: no worker")
+            return
         if self._st.acquiring:
-            # handled inside the worker loop immediately
             self.send_gains.emit({"__refresh__": True})
         else:
-            # safe when idle
             QMetaObject.invokeMethod(self._worker, "query_gains", Qt.QueuedConnection)
 
     @Slot(float, int)
     def auto_desaturate(self, target_frac: float = 0.85, max_iters: int = 5) -> None:
-        print(f"[UI] auto_desaturate() called target={target_frac} iters={max_iters}")
+        log.info("[UI] auto_desaturate(target=%s, steps=%s)", target_frac, max_iters)
         if not self._worker:
             return
-        # Mailbox push — Direct so it lands even while the worker’s loop is running
         self.send_desat.emit(float(target_frac), int(max_iters))
-        # If idle, process immediately once
         if not self._st.acquiring:
             QMetaObject.invokeMethod(self._worker, "process_pending_desat", Qt.QueuedConnection)
 
@@ -1190,7 +1424,8 @@ class IDSCamera(QObject):
                 v = d.get(k)
                 if v is not None:
                     out[k] = int(round(float(v)))
-            if out: self._last_roi = out
+            if out:
+                self._last_roi = out
         except Exception:
             pass
 
@@ -1198,11 +1433,13 @@ class IDSCamera(QObject):
     def set_zoom_roi(self, xywh: object) -> None:
         """Request a small ROI around a spot: (x, y, w, h)."""
         if not isinstance(xywh, (tuple, list)) or len(xywh) != 4:
-            print("[UI] set_zoom_roi ignored (bad tuple):", xywh); return
+            log.debug("[UI] set_zoom_roi ignored (bad tuple): %s", xywh)
+            return
         try:
             x, y, w, h = [int(round(float(v))) for v in xywh]
         except Exception:
-            print("[UI] set_zoom_roi ignored (parse failed):", xywh); return
+            log.debug("[UI] set_zoom_roi ignored (parse failed): %s", xywh)
+            return
 
         if self._zoom_prev_roi is None:
             lr = self._last_roi
@@ -1218,10 +1455,23 @@ class IDSCamera(QObject):
     def clear_zoom_roi(self) -> None:
         """Restore ROI that was active before the first set_zoom_roi()."""
         if self._zoom_prev_roi is None:
-            print("[UI] clear_zoom_roi: nothing to restore"); return
+            log.debug("[UI] clear_zoom_roi: nothing to restore")
+            return
         w, h, x, y = self._zoom_prev_roi
         self._zoom_prev_roi = None
         self.set_roi(w, h, x, y)
+
+    @Slot()
+    def force_raw_mono12(self) -> None:
+        """Public facade call; runs in worker thread. Safe only when idle."""
+        if not self._worker:
+            self.error.emit("Format guard ignored: no worker.")
+            return
+        if self._st.acquiring:
+            self.error.emit("Format change requires camera to be stopped.")
+            return
+        # Run synchronously so open() can show immediate errors
+        QMetaObject.invokeMethod(self._worker, "force_raw_mono12", Qt.BlockingQueuedConnection)
 
     # ---------- cleanup ----------
     def _cleanup_all(self) -> None:
@@ -1243,7 +1493,7 @@ class IDSCamera(QObject):
         self._device = None
         self._library_close_safe()
         self._st = _State(open=False, acquiring=False)
-        print("[UI] cleanup complete")
+        log.info("[UI] cleanup complete")
 
     def _library_close_safe(self) -> None:
         try:

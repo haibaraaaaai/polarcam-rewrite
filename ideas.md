@@ -52,3 +52,7 @@ src/polarcam/
 │   └─ log.py                # structured logger
 │
 └─ cli.py                    # entrypoint (creates MainWindow)  ##
+
+
+
+need for varmap, some sort of background substraction since it just seem to mirror hte base intensity of the image a bit (so something bright will just be somewhat bright in the varmap compare to dimmer stuff, when both not rotating)

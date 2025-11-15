@@ -6,7 +6,7 @@ import math
 from typing import Optional, List, Tuple
 import numpy as np
 
-from PySide6.QtCore import Qt, Signal, QThread
+from PySide6.QtCore import Qt, Signal, QThread, Slot
 from PySide6.QtGui import QImage, QPixmap, QIntValidator, QDoubleValidator, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,7 +30,7 @@ from polarcam.app.lut_widget import HighlightLUTWidget
 from polarcam.app.spot_detect import detect_spots_oneframe
 from polarcam.app.spot_viewer import SpotViewerDialog
 
-# NEW: cycling recorder
+# Cycling recorder
 from polarcam.app.spot_cycler import MultiSpotCycler, CycleConfig
 
 # Old/desired spot tuple: (cx, cy, r, area, inten)
@@ -87,18 +87,33 @@ class MainWindow(QMainWindow):
         # wire controller/backend signals if present
         cam = getattr(self.ctrl, "cam", None)
         if cam is not None:
-            cam.opened.connect(self._on_open)
-            cam.started.connect(self._on_started)
-            cam.stopped.connect(self._on_stopped)
-            cam.closed.connect(self._on_closed)
-            cam.error.connect(self._on_error)
-            cam.frame.connect(self._on_frame)
-            cam.timing.connect(self._on_timing)
-            cam.roi.connect(self._on_roi)
-            cam.gains.connect(self._on_gains)
-            if hasattr(cam, "desaturated"): cam.desaturated.connect(self._on_desaturated)
-            if hasattr(cam, "auto_desat_started"): cam.auto_desat_started.connect(self._on_desat_started)
-            if hasattr(cam, "auto_desat_finished"): cam.auto_desat_finished.connect(self._on_desat_finished)
+            try: cam.opened.connect(self._on_open)
+            except Exception: pass
+            try: cam.started.connect(self._on_started)
+            except Exception: pass
+            try: cam.stopped.connect(self._on_stopped)
+            except Exception: pass
+            try: cam.closed.connect(self._on_closed)
+            except Exception: pass
+            try: cam.error.connect(self._on_error)
+            except Exception: pass
+            try: cam.frame.connect(self._on_frame)
+            except Exception: pass
+            try: cam.timing.connect(self._on_timing)
+            except Exception: pass
+            try: cam.roi.connect(self._on_roi)
+            except Exception: pass
+            try: cam.gains.connect(self._on_gains)
+            except Exception: pass
+            if hasattr(cam, "desaturated"):
+                try: cam.desaturated.connect(self._on_desaturated)
+                except Exception: pass
+            if hasattr(cam, "auto_desat_started"):
+                try: cam.auto_desat_started.connect(self._on_desat_started)
+                except Exception: pass
+            if hasattr(cam, "auto_desat_finished"):
+                try: cam.auto_desat_finished.connect(self._on_desat_finished)
+                except Exception: pass
         else:
             self.status.showMessage("No camera backend attached.", 4000)
 
@@ -119,7 +134,7 @@ class MainWindow(QMainWindow):
         self.btn_view_spot.clicked.connect(self._view_selected_spots)
         self.btn_remove_spot.clicked.connect(self._remove_selected_spots)
 
-        # NEW: Cycle buttons
+        # Cycle buttons
         self.btn_cycle_start.clicked.connect(self._start_cycle_clicked)
         self.btn_cycle_stop.clicked.connect(self._stop_cycle_clicked)
 
@@ -243,7 +258,7 @@ class MainWindow(QMainWindow):
         self.spot_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.btn_view_spot = QPushButton("View spot…")
         self.btn_remove_spot = QPushButton("Remove selected")
-        # NEW: Cycle controls
+        # Cycle controls
         self.btn_cycle_start = QPushButton("Start Cycle (1 s / spot)")
         self.btn_cycle_stop  = QPushButton("Stop Cycle")
         self.btn_cycle_stop.setEnabled(False)
@@ -275,6 +290,27 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(start)
         self.btn_stop.setEnabled(stop)
         self.btn_close.setEnabled(close)
+
+    # Centralize UI lock/unlock while cycling
+    def _set_cycle_ui_state(self, active: bool) -> None:
+        self._cycle_active = bool(active)
+        # Buttons that could fight with cycling
+        for w in [
+            self.btn_detect, self.btn_clear_overlays,
+            self.btn_apply_roi, self.btn_full_roi,
+            self.btn_apply_tim, self.btn_desat,
+            self.btn_apply_gains, self.btn_refresh_gains,
+            self.btn_view_spot, self.btn_remove_spot,
+            self.spot_list,
+        ]:
+            try:
+                w.setEnabled(not active)
+            except Exception:
+                pass
+        self.btn_cycle_start.setEnabled(not active)
+        self.btn_cycle_stop.setEnabled(active)
+        if active:
+            self._last_preview_t = 0.0  # reset throttle timer
 
     # ---------- backend signal handlers ----------
     def _on_open(self, name: str) -> None:
@@ -341,7 +377,7 @@ class MainWindow(QMainWindow):
         """Draw spot overlays on the unscaled frame, then return a QPixmap."""
         h, w = a8.shape
         qimg = QImage(a8.data, w, h, w, QImage.Format_Grayscale8)
-        pm = QPixmap.fromImage(qimg.copy())
+        pm = QPixmap.fromImage(qimg.copy())  # own memory for safety
 
         if not self._spots:
             return pm
@@ -444,8 +480,12 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Detect: grabbing one frame…", 0)
 
         if not self._detect_conn_active:
-            self.ctrl.cam.frame.connect(self._collect_for_detect_1f, Qt.QueuedConnection)
-            self._detect_conn_active = True
+            try:
+                self.ctrl.cam.frame.connect(self._collect_for_detect_1f, Qt.QueuedConnection)
+                self._detect_conn_active = True
+            except Exception:
+                self._detect_conn_active = False
+                self.detect_done.emit(("err", "Camera not available for detect."))
 
     def _collect_for_detect_1f(self, arr_obj: object) -> None:
         if not self._detect_conn_active:
@@ -525,7 +565,6 @@ class MainWindow(QMainWindow):
     def _resume_main_video(self) -> None:
         if self._video_paused:
             try:
-                # reconnect only if not already connected
                 self.ctrl.cam.frame.connect(self._on_frame, Qt.QueuedConnection)
                 print("[MainWindow] Live preview resumed.")
             except Exception:
@@ -574,33 +613,48 @@ class MainWindow(QMainWindow):
     # ---------- CYCLE: start/stop threads ----------
     def _start_cycle_clicked(self) -> None:
         if not self._spots:
-            QMessageBox.information(self, "Cycle", "No spots selected/detected."); return
-
-        # Record to ./cycles by default
+            QMessageBox.information(self, "Cycle", "No spots selected/detected.")
+            return
         out_dir = os.path.join(os.getcwd(), "cycles")
         cfg = CycleConfig(
             out_dir=out_dir,
             base_name="cycle",
-            dwell_sec=1.0,             # 1 s per spot (as requested)
-            max_duration_sec=3600,     # guard: up to 1 hour
-            chunk_len=20000,           # flush often to avoid RAM growth
-            maximize_camera_fps=True,  # record at max FPS possible
+            dwell_sec=1.0,
+            max_duration_sec=3600,
+            chunk_len=20000,
+            maximize_camera_fps=True,
         )
 
         if self._cycle_thread is not None:
-            QMessageBox.information(self, "Cycle", "Cycler already running."); return
+            QMessageBox.information(self, "Cycle", "Cycler already running.")
+            return
+
+        # Build cycler with error guard — if __init__ throws, self._cycler would stay None.
+        try:
+            cycler = MultiSpotCycler(self.ctrl, self._spots, cfg)
+        except Exception as e:
+            self.status.showMessage(f"Cycle init error: {e}", 6000)
+            return
 
         self._cycle_thread = QThread(self)
-        self._cycler = MultiSpotCycler(self.ctrl.cam, self._spots, cfg)
+        self._cycler = cycler
         self._cycler.moveToThread(self._cycle_thread)
 
-        self._cycle_thread.started.connect(self._cycler.start)
-        self._cycler.progress.connect(lambda s: self.status.showMessage(s, 1200))
-        self._cycler.error.connect(lambda e: self.status.showMessage(f"Cycle error: {e}", 5000))
-        self._cycler.stopped.connect(self._cycle_thread.quit)
-        self._cycle_thread.finished.connect(self._cycle_finished)
+        # signals
+        try:
+            self._cycler.advise_ui_cap.connect(self._on_cycle_ui_cap)
+        except Exception:
+            pass  # older builds without the signal
 
-        # Enable preview throttle (cap to ~20 fps) while recording at max FPS
+        # signals
+        self._cycle_thread.started.connect(self._cycler.start,       Qt.QueuedConnection)
+        self._cycler.progress.connect(self._on_cycler_progress,      Qt.QueuedConnection)
+        self._cycler.error.connect(self._on_cycler_error,            Qt.QueuedConnection)
+        self._cycler.stopped.connect(self._cycle_thread.quit,        Qt.QueuedConnection)
+        self._cycler.advise_ui_cap.connect(self._on_cycle_ui_cap,    Qt.QueuedConnection)
+        self._cycle_thread.finished.connect(self._cycle_finished,    Qt.QueuedConnection)
+
+        # Enable preview throttle on our side; worker will also advise via signal
         self._cycle_active = True
         self._last_preview_t = 0.0
 
@@ -621,10 +675,29 @@ class MainWindow(QMainWindow):
         # Thread finished
         self._cycler = None
         self._cycle_thread = None
-        self.btn_cycle_start.setEnabled(True)
-        self.btn_cycle_stop.setEnabled(False)
-        self._cycle_active = False
+        self._set_cycle_ui_state(False)
         self.status.showMessage("Cycle stopped.", 2500)
+
+    @Slot(str)
+    def _on_cycler_progress(self, s: str) -> None:
+        # Safe: runs on GUI thread
+        self.status.showMessage(s, 1200)
+
+    @Slot(str)
+    def _on_cycler_error(self, msg: str) -> None:
+        # Safe: runs on GUI thread
+        self.status.showMessage(f"Cycle error: {msg}", 5000)
+
+    @Slot(float)
+    def _on_cycle_ui_cap(self, cap: float) -> None:
+        # 0.0 = uncap (disable throttle); >0 = cap to that FPS
+        if cap and cap > 0.0:
+            self._preview_cap_fps = float(cap)
+            self._cycle_active = True
+        else:
+            self._preview_cap_fps = 0.0
+            self._cycle_active = False
+        self._last_preview_t = 0.0  # reset throttle phase
 
     # ---------- UI handlers (UI → controller) ----------
     def _open_clicked(self) -> None:
@@ -738,6 +811,16 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
         self._refresh_video_view()
+
+    @Slot(float)
+    def _on_cycle_ui_cap(self, hz: float) -> None:
+        """Failsafe UI preview cap while the cycler runs (recording stays max FPS)."""
+        if hz and hz > 0:
+            self._preview_cap_fps = float(hz)
+            self._last_preview_t = 0.0
+            self._cycle_active = True
+        else:
+            self._cycle_active = False
 
     # ---------- cleanup ----------
     def safe_shutdown(self) -> None:

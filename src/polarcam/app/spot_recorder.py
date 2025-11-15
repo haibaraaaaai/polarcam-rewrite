@@ -1,4 +1,3 @@
-# src/polarcam/app/spot_recorder.py
 from __future__ import annotations
 import os, json, math, time, threading
 from dataclasses import dataclass
@@ -11,29 +10,35 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
 # Polar mosaic layout:
 # (row%2, col%2): (0,0)=90°, (0,1)=45°, (1,0)=135°, (1,1)=0°
 
-# -------------------------- small utils --------------------------
+# ---------- Hardware constraints (same as cycler) ----------
+SENSOR_W, SENSOR_H = 2464, 2056
+STEP_W, STEP_H = 4, 2
+OFFX_STEP, OFFY_STEP = 4, 2
+MIN_W, MIN_H = 256, 2
+MAX_W, MAX_H = SENSOR_W, SENSOR_H
+OFFX_MIN, OFFX_MAX = 0, 2208
+OFFY_MIN, OFFY_MAX = 0, 2054
+
+def _snap_down(v: int, step: int) -> int:
+    return int((int(v) // step) * step)
+
+# --------------------------
+# small utils
+# --------------------------
 def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
-def _round_up(v: int, step: int) -> int:
-    if step <= 1: return int(v)
-    return int(((int(v) + step - 1)//step)*step)
-
 def _snap_even(v: int) -> int:
     return int(v if (int(v) % 2 == 0) else int(v) + 1)
-
-# -------------------------- ROI constraints (tune for camera) --------------------------
-W_STEP = 16
-H_STEP = 2
-MIN_W  = 64
-MIN_H  = 32
 
 PAD_SW   = 2      # software padding around diameter
 MIN_CROP = 10     # minimum crop side (even)
 
 DEFAULT_CHUNK = 20000  # samples per shard
 
-# -------------------------- dataclasses --------------------------
+# --------------------------
+# dataclasses
+# --------------------------
 @dataclass
 class Spot:
     cx: float
@@ -49,7 +54,9 @@ class RecorderConfig:
     chunk_len: int = DEFAULT_CHUNK
     maximize_camera_fps: bool = True   # set_timing(inf, None)
 
-# -------------------------- shard writer (own thread) --------------------------
+# --------------------------
+# shard writer (own thread)
+# --------------------------
 class _ShardWriter(QObject):
     finished = Signal()
     error = Signal(str)
@@ -87,34 +94,23 @@ class _ShardWriter(QObject):
                         break
                     chunk = self._q.popleft()
                 fn = os.path.join(self._out_dir, f"{self._prefix}_chunk{self._idx:04d}.npy")
-                # shape (N,5): [t, I0, I45, I90, I135] float32
-                np.save(fn, chunk)
+                np.save(fn, chunk)   # (N,5): t, I0, I45, I90, I135
                 self._idx += 1
         except Exception as e:
             self.error.emit(str(e))
         finally:
             self.finished.emit()
 
-# -------------------------- headless recorder --------------------------
+# --------------------------
+# headless recorder
+# --------------------------
 class SpotSignalRecorder(QObject):
-    """
-    Background recorder:
-    - Shrinks HW ROI around the spot
-    - Runs camera at max FPS (optional)
-    - Saves mean 4×pol signals in chunked .npy shards
-    """
     started = Signal()
     stopped = Signal()
     error = Signal(str)
     progress = Signal(int)   # total samples written
 
     def __init__(self, cam, ctrl, spot: Spot, cfg: RecorderConfig):
-        """
-        cam  : camera object (emits .frame(np.ndarray) and .roi(dict))
-        ctrl : object with set_roi(w,h,x,y) and set_timing(fps, exposure_ms)
-        spot : target spot
-        cfg  : output + behavior
-        """
         super().__init__()
         self.cam  = cam
         self.ctrl = ctrl
@@ -124,7 +120,7 @@ class SpotSignalRecorder(QObject):
         self._applied_roi: Tuple[int,int,int,int] = (0,0,0,0)  # x,y,w,h
 
         self._chunk_len = int(max(1000, cfg.chunk_len))
-        self._buf = np.empty((self._chunk_len, 5), dtype=np.float32)  # t, I0, I45, I90, I135
+        self._buf = np.empty((self._chunk_len, 5), dtype=np.float32)
         self._buf_i = 0
         self._total = 0
 
@@ -143,24 +139,40 @@ class SpotSignalRecorder(QObject):
         self._running = False
         self._t0 = 0.0
 
+    # ---- ROI helper (aggressive: H≈2r, W=256) ----
+    def _roi_for_spot(self, cx: float, cy: float, r: float) -> tuple[int,int,int,int]:
+        h_want = max(MIN_H, int(math.ceil(2.0 * max(0.0, float(r)))))
+        h = _snap_down(h_want + (STEP_H - 1), STEP_H)
+        h = max(MIN_H, min(MAX_H, h))
+
+        w = max(MIN_W, min(MAX_W, _snap_down(MIN_W + (STEP_W - 1), STEP_W)))
+
+        x = int(round(cx - w/2.0))
+        y = int(round(cy - h/2.0))
+
+        x = max(OFFX_MIN, min(OFFX_MAX, x)); x = _snap_down(x, OFFX_STEP)
+        y = max(OFFY_MIN, min(OFFY_MAX, y)); y = _snap_down(y, OFFY_STEP)
+
+        if x + w > SENSOR_W:
+            x = _snap_down(SENSOR_W - w, OFFX_STEP); x = max(OFFX_MIN, min(OFFX_MAX, x))
+        if y + h > SENSOR_H:
+            y = _snap_down(SENSOR_H - h, OFFY_STEP); y = max(OFFY_MIN, min(OFFY_MAX, y))
+
+        return (w, h, x, y)
+
     # ---- lifecycle ----
     def start(self) -> None:
         try: os.makedirs(self.cfg.out_dir, exist_ok=True)
         except Exception: pass
 
-        # Small HW ROI centered on spot
-        cx, cy, r = self.spot.cx, self.spot.cy, max(4.0, float(self.spot.r))
-        want_side = int(round(2.2 * r))
-        hw = _round_up(max(MIN_W, want_side), W_STEP)
-        hh = _round_up(max(MIN_H, want_side), H_STEP)
-        x0 = int(round(cx - hw/2)); y0 = int(round(cy - hh/2))
+        cx, cy, r = self.spot.cx, self.spot.cy, float(self.spot.r)
+        hw, hh, x0, y0 = self._roi_for_spot(cx, cy, r)
         self.ctrl.set_roi(hw, hh, x0, y0)
 
         if self.cfg.maximize_camera_fps:
             try: self.ctrl.set_timing(float("inf"), None)
             except Exception: pass
 
-        # metadata
         meta = {
             "spot": {"cx": cx, "cy": cy, "r": self.spot.r, "area": self.spot.area, "inten": self.spot.inten},
             "layout": {"(0,0)": "90", "(0,1)": "45", "(1,0)": "135", "(1,1)": "0"},
@@ -182,18 +194,26 @@ class SpotSignalRecorder(QObject):
         if not self._running:
             return
         self._running = False
-        # flush any remainder
+
+        # flush last partial chunk
         try:
             if self._buf_i > 0:
                 self._writer.enqueue(self._buf[:self._buf_i].copy())
                 self._buf_i = 0
         except Exception:
             pass
+
+        # close writer and wait for its thread to finish
         try:
             self._writer.close()
-        finally:
-            # ensure the writer thread finishes so we don't leak
-            self._writer_thr.wait(3000)
+        except Exception:
+            pass
+        try:
+            # finished -> quit is already connected; just wait for the thread to exit.
+            self._writer_thr.wait(5000)
+        except Exception:
+            pass
+
         self.stopped.emit()
 
     # ---- camera reports ----
@@ -221,7 +241,7 @@ class SpotSignalRecorder(QObject):
         rcx = float(self.spot.cx) - float(ax)
         rcy = float(self.spot.cy) - float(ay)
 
-        diameter = max(2.0, 2.0 * float(max(4.0, self.spot.r)))
+        diameter = max(2.0, 2.0 * float(max(1.0, self.spot.r)))
         want = int(math.ceil(diameter + 2 * PAD_SW))
         side = _snap_even(max(MIN_CROP, min(aw, ah, want)))
 
@@ -230,7 +250,6 @@ class SpotSignalRecorder(QObject):
         jx = _clamp(ix + side, ix + 1, aw)
         jy = _clamp(iy + side, iy + 1, ah)
 
-        # keep within received frame
         ix = _clamp(ix, 0, a16.shape[1] - 1); jx = _clamp(jx, ix + 1, a16.shape[1])
         iy = _clamp(iy, 0, a16.shape[0] - 1); jy = _clamp(jy, iy + 1, a16.shape[0])
 

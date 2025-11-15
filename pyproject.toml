@@ -16,8 +16,25 @@ dependencies = [
     "matplotlib",
 ]
 
+# Optional, developer-focused tools
+[project.optional-dependencies]
+dev = ["pyinstaller>=6.0", "black", "ruff", "mypy"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["polarcam*"]
 
+# Ship common UI assets if you add them later (harmless if none exist)
+[tool.setuptools.package-data]
+"polarcam" = ["**/*.qss", "**/*.ico", "**/*.png"]
+
+# CLI entry point (shows a console on Windows)
 [project.scripts]
-polarcam = "polarcam.app:main"
+polarcam = "polarcam.cli:main"
+
+# GUI entry point (no console window on Windows)
+[project.entry-points."gui_scripts"]
+polarcam-gui = "polarcam.cli:main"

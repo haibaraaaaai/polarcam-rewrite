@@ -228,8 +228,8 @@ class SpotViewerWindow(QMainWindow):
         self._rec.moveToThread(self._rec_thread)
 
         self._rec_thread.started.connect(self._rec.start)
-        self._rec.progress.connect(lambda n: (self.status.showMessage(f"Recording… {n} samples", 1000), self.rec_progress.emit(n)))
-        self._rec.error.connect(lambda msg: self.status.showMessage(f"Recorder error: {msg}", 4000))
+        self._rec.progress.connect(self._rec_on_progress, Qt.QueuedConnection)
+        self._rec.error.connect(self._rec_on_error, Qt.QueuedConnection)
         self._rec.stopped.connect(self._rec_thread.quit)
 
         self._rec_thread.start()
@@ -250,6 +250,14 @@ class SpotViewerWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.status.showMessage("Recorder stopped.", 2000)
+
+    @Slot(int)
+    def _rec_on_progress(self, n: int) -> None:
+        self.status.showMessage(f"Recording… {n} samples", 1000)
+
+    @Slot(str)
+    def _rec_on_error(self, msg: str) -> None:
+        self.status.showMessage(f"Recorder error: {msg}", 4000)
 
     # ---- cleanup ----
     def closeEvent(self, e):

@@ -4,7 +4,7 @@
 ## 0) TL;DR — run it
 
 ```bash
-# 1) create & activate venv (Windows PowerShell shown)
+# 1) create & activate venv
 python -m venv .venv
 . .venv/Scripts/Activate.ps1
 python -m pip install -U pip
@@ -12,8 +12,8 @@ python -m pip install -U pip
 # 2) editable install
 python -m pip install -e .
 
-# 3) IDS SDK (if using IDS camera)
-# Install the IDS Peak runtime/driver (GUI installer from IDS).
+# 3) IDS SDK
+# Install the IDS peak Cockpit.
 # Then the Python wheels:
 python -m pip install --no-deps ids-peak ids-peak-ipl
 
@@ -26,20 +26,20 @@ python -m polarcam.cli
 
 **First things to check in the UI**
 
-* **Exposure is in milliseconds** (the textbox label says *Exposure (ms)*).
-* **ROI**: “Full sensor” first; then use small ROIs for speed.
-* **Gains**: hit **Refresh gains** to populate min/max; apply only if you actually set values.
+* **Exposure is in milliseconds**
+* **ROI**: “Full sensor” to set max ROI; then use small ROIs for speed.
+* **Gains**: hit **Refresh gains** to populate min/max if not already shown.
 
 ---
 
 ## 1) What this app does today
 
-* Live preview of the polarization camera (12→8‑bit highlight LUT with floor/cap/gamma, + histogram).
+* Live preview of the polarization camera (12→8‑bit highlight LUT with floor/cap/gamma).
 * ROI + timing controls (FPS + **exposure in ms**), desaturate helper.
 * Analog/digital gains.
-* **Spot detection** on a single frame (SciPy morphology; overlays + numbered labels).
+* **Spot detection** on a single frame.
 * **Spot viewer**: shows a zoomed crop (UI capped ≤20 Hz), optional **recording at max camera FPS** (saves `.npy` shards).
-* **Multi‑spot cycler/recorder**: hops a tight HW‑ROI around selected spots, records 4×‐pol mean signals per dwell to compressed `.npz` shards.
+* **Multi‑spot cycler/recorder**: hops a tight HW‑ROI around selected spots, one second per spot per cycle, records 4×‐pol mean signals per dwell to compressed `.npz` shards.
 * **Variance map** tool: capture N frames → compute per‑pixel **intensity range** or **stddev** → preview + save `.npy` (and optional `.png`).
 
 **Directory conventions**
@@ -50,20 +50,7 @@ python -m polarcam.cli
 
 ---
 
-## 2) IDS camera specifics we currently assume
-
-Hardware constraints baked into the spot‑cycler (edit in code if your sensor differs):
-
-* **Width**: min **256**, max **2464**, **step 4**
-* **Height**: min **2**, max **2056**, **step 2**
-* **OffsetX**: min **0**, max **2208**, **step 4**
-* **OffsetY**: min **0**, max **2054**, **step 2**
-
-The cycler picks the **smallest legal HW‑ROI** centered on the spot, based on spot radius, and re‑applies **`set_timing(inf, None)` after each ROI change** so FPS re‑maxes under the new ROI/exposure. Preview stays capped to reduce UI load; recording runs at full camera rate.
-
----
-
-## 3) Typical workflows
+## 2) Typical workflows
 
 ### A) Live + detect + view
 
@@ -93,7 +80,7 @@ The cycler picks the **smallest legal HW‑ROI** centered on the spot, based on 
 
 ---
 
-## 4) Data formats
+## 3) Data formats
 
 ### Cycle `.npz` shards
 
@@ -116,11 +103,11 @@ N×5 float32` arrays: columns = `[t, I0, I45, I90, I135]`.
 
 ---
 
-## 5) Offline helpers (scripts)
+## 4) Offline helpers (scripts)
 
 Location: `polarcam/offline/`
 
-### 5.1 `analyze_cycle_npz.py` — FPS sanity + dwell summary
+### 4.1 `analyze_cycle_npz.py` — FPS sanity + dwell summary
 
 Quickly summarizes cycle NPZ shards by dwell and spot. Prints per‑dwell sample counts, durations, mean FPS, and writes a CSV.
 
@@ -132,7 +119,7 @@ python -m polarcam.offline.analyze_cycle_npz cycles/cycle_spot01/*.npz
 python -m polarcam.offline.analyze_cycle_npz cycles/cycle_spot01
 ```
 
-### 5.2 `inspect_captures_npz.py` — explore viewer `.npy` shards
+### 4.2 `inspect_captures_npz.py` — explore viewer `.npy` shards
 
 Loads spot‑viewer shards, checks gaps, basic stats, quick plots if you want them.
 
@@ -142,7 +129,7 @@ Loads spot‑viewer shards, checks gaps, basic stats, quick plots if you want th
 python -m polarcam.offline.inspect_captures_npz captures
 ```
 
-### 5.3 `spot_from_stack.py` — test varmap & compute XY traces
+### 4.3 `spot_from_stack.py` — test varmap & compute XY traces
 
 Takes a saved stack `(T,H,W) uint16`, builds a highlight LUT view of frame 0, finds spots on the view, computes per‑spot normalized XY traces using the correct 2×2 polarization parity, and writes small per‑spot reports (PNGs + CSVs).
 
@@ -159,7 +146,7 @@ Outputs live under `spot_from_stack_YYYYMMDD-HHMMSS/`.
 
 ---
 
-## 6) What’s next / near‑term plan
+## 5) What’s next / near‑term plan
 
 * **UI polish**: clearer state (started/paused), progress bars, cancellation that never blocks the UI.
 * **Spot viewer analysis**: add **FFT/peak‑finder** and **anisotropy (x,y)** readouts live; optional export of XY traces.
@@ -171,17 +158,15 @@ Outputs live under `spot_from_stack_YYYYMMDD-HHMMSS/`.
 
 ---
 
-## 7) Known gotchas
+## 6) Known gotchas
 
-* If you see *“QObject::startTimer / killTimer from another thread”*, it’s almost always a timer created or stopped outside the GUI thread. We avoid `QApplication.processEvents()` in worker loops and keep timer usage strictly on the main thread.
-* Exposure textbox is **milliseconds**. `set_timing(inf, None)` lets the camera choose the **max FPS** for the current ROI + exposure; changing ROI or exposure changes that ceiling.
-* ROI snapping: hardware enforces the step/min/max above; what you ask for isn’t always what you get (watch the status bar or ROI fields for the applied values).
+* ROI snapping: hardware enforces the step/min/max allowed by the camera; and sometimes snapping to a spot will over/under cut the spot.
 
 ---
 
-## 8) Contact / notes to self
+## 7) Notes to self
 
-* Core analysis defaults: alias guard (fps/4), phase‑binned A26 as occupancy cue, HMM/change‑points for N(t), Allan variance for timescales.
+* Alias guard (fps/4).
 * Polarization layout reminder: (0,0)=90°, (0,1)=45°, (1,0)=135°, (1,1)=0°.
 
 (End)

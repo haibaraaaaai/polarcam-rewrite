@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -9,11 +8,15 @@ from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QLabel, QVBoxLayout, QHBoxLayout, QSpinBox,
-    QComboBox, QCheckBox, QPushButton, QProgressBar, QPlainTextEdit, QWidget
+    QComboBox, QCheckBox, QPushButton, QProgressBar,
+    QPlainTextEdit, QWidget
 )
 
-
 class VarMapDialog(QDialog):
+    """
+    Lightweight UI for capturing N frames, computing a per-pixel activity map,
+    and previewing/saving the result. Uses Controller.varmap_capture_and_compute().
+    """
     def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
         super().__init__(
             parent,
@@ -28,7 +31,7 @@ class VarMapDialog(QDialog):
         self.setWindowTitle("Variance map")
         self.resize(900, 650)
 
-        self.ctrl = controller   # your Controller
+        self.ctrl = controller
         self._stack_path: Optional[Path] = None
         self._map_path: Optional[Path] = None
         self._last_map8: Optional[np.ndarray] = None
@@ -36,14 +39,14 @@ class VarMapDialog(QDialog):
 
         # --- Controls row ---
         self.spn_frames = QSpinBox()
-        self.spn_frames.setRange(1, 1000)
+        self.spn_frames.setRange(1, 100_000)  # generous; memmap recommended for large N
         self.spn_frames.setValue(20)
 
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems([
-            "intensity_range",      # max - min (cheap)
-            "stddev",               # per-pixel stdev (more robust)
-            "max_pairwise_dist"     # largest |x_i - x_j| (placeholder/expensive)
+            "intensity_range",      # fast: max - min
+            "stddev",               # robust-ish dispersion
+            "max_pairwise_dist"     # alias of range for now (see analysis/varmap.py)
         ])
 
         self.chk_memmap = QCheckBox("Memmap capture (low RAM)")
@@ -71,7 +74,7 @@ class VarMapDialog(QDialog):
         self.prog.setValue(0)
         self.prog.setTextVisible(True)
 
-        # --- Preview (variance map image) ---
+        # --- Preview ---
         self.preview = QLabel("No result yet")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setStyleSheet("background:#111; color:#777;")
@@ -81,7 +84,9 @@ class VarMapDialog(QDialog):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
-        self.log.setStyleSheet("background:#0c0c0c; color:#d0d0d0; font-family: Consolas, monospace; font-size: 11px;")
+        self.log.setStyleSheet(
+            "background:#0c0c0c; color:#d0d0d0; font-family: Consolas, monospace; font-size: 11px;"
+        )
 
         # --- Save row ---
         self.btn_save_map = QPushButton("Save map as .npy")
@@ -117,7 +122,8 @@ class VarMapDialog(QDialog):
     # Public helpers
     # ------------------------------------------
     def append_log(self, text: str) -> None:
-        ts = time.strftime("%H:%M:%S")
+        from time import strftime
+        ts = strftime("%H:%M:%S")
         self.log.appendPlainText(f"[{ts}] {text}")
 
     def set_progress(self, pct: int) -> None:
@@ -167,11 +173,11 @@ class VarMapDialog(QDialog):
         self._cancelled = False
 
         try:
-            # Run synchronously; controller pumps events internally.
+            # Runs synchronously; controller pumps events internally.
             res = self.ctrl.varmap_capture_and_compute(
                 n_frames=n,
                 mode=mode,
-                memmap=use_memmap,            # controller accepts memmap/use_memmap
+                memmap=use_memmap,
                 on_progress=self._progress_cb,
                 cancel_flag=lambda: self._cancelled,
             )
@@ -194,7 +200,7 @@ class VarMapDialog(QDialog):
             self.btn_cancel.setEnabled(False)
 
     def _on_cancel_clicked(self) -> None:
-        # We rely on cancel_flag() being polled in the controller loop
+        # Cancel flag is polled inside the controller loop
         self._cancelled = True
         self.append_log("Cancel requested.")
         self.btn_cancel.setEnabled(False)
@@ -204,15 +210,15 @@ class VarMapDialog(QDialog):
     # ------------------------------------------
     def _progress_cb(self, frac: float, msg: str = "") -> None:
         self.set_progress(int(max(0.0, min(1.0, float(frac))) * 100))
+        # Keep logging light; only append meaningful milestones
         if msg:
-            # Keep logs lightweight—only append occasionally if desired
             self.append_log(msg)
 
     # ------------------------------------------
     # Save helpers
     # ------------------------------------------
     def _save_map_npy(self) -> None:
-        # Controller already saved a .npy; just log it.
+        # Controller already saved a .npy; just log it for now.
         if self._map_path and self._map_path.suffix.lower() == ".npy":
             self.append_log(f"Map saved: {self._map_path}")
         else:

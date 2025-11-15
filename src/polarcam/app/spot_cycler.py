@@ -1,13 +1,14 @@
+# src/polarcam/app/spot_cycler.py
 from __future__ import annotations
 import json, math, os, time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 import numpy as np
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
+from PySide6.QtCore import QObject, Signal, Slot, Qt
 from PySide6.QtWidgets import QApplication
 
-# Polar mosaic (documented in your app):
+# Polar mosaic:
 # (0,0)=90°, (0,1)=45°, (1,0)=135°, (1,1)=0°
 
 SpotTuple = Tuple[float, float, float, int, int]  # (cx, cy, r, area, inten)
@@ -25,12 +26,8 @@ class CycleConfig:
 
 class MultiSpotCycler(QObject):
     """
-    Runs in its own thread. Cycles a small HW-ROI across given spots; for each dwell,
-    computes 4×pol mean signals from the *software* crop used for display and saves
-    to disk in NPZ chunks. Metadata per chunk includes:
-      - 'crop_abs' (x, y, w, h)  — the displayed/software crop in absolute sensor coords
-      - 'applied_roi' (x, y, w, h) — the snapped HW ROI during that dwell
-      - 'spot' (cx, cy, r, area, inten)
+    Cycles a small HW-ROI across given spots; for each dwell, computes 4×pol mean
+    signals from the software crop used for display and saves compressed shards (.npz).
     """
     started  = Signal()
     stopped  = Signal()
@@ -48,15 +45,17 @@ class MultiSpotCycler(QObject):
         self._applied_roi = (0, 0, 0, 0)  # (x,y,w,h)
         self._fps_now = 20.0
 
-        # Per-spot accumulators (lists -> flushed to disk)
-        self._acc = []    # [(t, c0, c45, c90, c135), ...] reset each flush
-        self._acc_t = []
-        self._acc0 = []; self._acc45 = []; self._acc90 = []; self._acc135 = []
-        self._chunk_idx = {}  # spot_idx -> next chunk number
+        # per-spot accumulators
+        self._acc_t: list[float] = []
+        self._acc0: list[float] = []
+        self._acc45: list[float] = []
+        self._acc90: list[float] = []
+        self._acc135: list[float] = []
+        self._chunk_idx: dict[int, int] = {}  # spot_idx -> next chunk number
 
         # saved pre-run state to restore
-        self._saved_roi = None
-        self._saved_fps = None
+        self._saved_roi: Optional[tuple[int,int,int,int]] = None
+        self._saved_fps: Optional[float] = None
 
     # ---------- public control ----------
     def start(self) -> None:
@@ -67,7 +66,6 @@ class MultiSpotCycler(QObject):
             self._connect_signals()
             self._save_pre_state()
 
-            # Maximize camera FPS if requested
             if self.cfg.maximize_camera_fps:
                 try:
                     self.cam.set_timing(float("inf"), None)  # go to camera fps_max
@@ -93,7 +91,6 @@ class MultiSpotCycler(QObject):
     # ---------- internals ----------
     def _setup_dirs(self) -> None:
         os.makedirs(self.cfg.out_dir, exist_ok=True)
-        # one subdir per spot
         for i, _ in enumerate(self.spots, start=1):
             os.makedirs(self._spot_dir(i), exist_ok=True)
 
@@ -101,27 +98,24 @@ class MultiSpotCycler(QObject):
         return os.path.join(self.cfg.out_dir, f"{self.cfg.base_name}_spot{i:02d}")
 
     def _save_pre_state(self) -> None:
-        # Snapshot ROI and FPS so we can restore on exit
+        # Ask backend to refresh so snapshots are up-to-date (best effort).
         self._saved_roi = (0, 0, 0, 0)
         self._saved_fps = None
         try:
-            # Ask backend to refresh so snapshots are up-to-date
-            if hasattr(self.cam, "refresh_roi"): self.cam.refresh_roi()
-            if hasattr(self.cam, "refresh_timing"): self.cam.refresh_timing()
+            if hasattr(self.cam, "refresh_roi"):
+                self.cam.refresh_roi()
+            if hasattr(self.cam, "refresh_timing"):
+                self.cam.refresh_timing()
         except Exception:
             pass
-        # Applied ROI will be filled by _on_roi_update
-        # FPS by _on_timing_update
 
     def _restore_pre_state(self) -> None:
-        # Restore ROI
         try:
             x, y, w, h = self._saved_roi or (0, 0, 0, 0)
             if w and h:
                 self.cam.set_roi(w, h, x, y)
         except Exception:
             pass
-        # Restore FPS
         try:
             if self._saved_fps is not None:
                 self.cam.set_timing(self._saved_fps, None)
@@ -154,7 +148,6 @@ class MultiSpotCycler(QObject):
             if w and h:
                 self._applied_roi = (x, y, w, h)
                 if (self._saved_roi == (0, 0, 0, 0)) and (self._saved_roi is not None):
-                    # first valid snapshot—treat as pre-state
                     self._saved_roi = (x, y, w, h)
         except Exception:
             pass
@@ -175,11 +168,8 @@ class MultiSpotCycler(QObject):
         t0 = time.perf_counter()
         spot_idx = 0
         dwell_idx = 0
-
-        # Seed chunk counters
         self._chunk_idx = {i: 0 for i in range(len(self.spots))}
 
-        # Ensure acquisition is running
         try:
             if hasattr(self.cam, "start"):
                 self.cam.start()
@@ -187,16 +177,14 @@ class MultiSpotCycler(QObject):
             pass
 
         while not self._want_stop:
-            # Max duration guard
             if (time.perf_counter() - t0) >= max(1.0, float(self.cfg.max_duration_sec)):
                 self.progress.emit("Max duration reached; stopping.")
                 break
 
             i = spot_idx % len(self.spots)
-            spot = self.spots[i]
-            cx, cy, r, area, inten = spot
+            cx, cy, r, area, inten = self.spots[i]
 
-            # Apply a small HW ROI around the spot (camera may snap to min 256×H etc.)
+            # Apply a small HW ROI around the spot (camera may snap to min steps).
             req_w, req_h, req_x, req_y = self._hw_roi_request_for_spot(cx, cy, r)
             try:
                 self.cam.set_roi(req_w, req_h, req_x, req_y)
@@ -204,40 +192,32 @@ class MultiSpotCycler(QObject):
                 self.error.emit(f"Failed set_roi for spot {i+1}: {e}")
                 return
 
-            # Let ROI settle; a few event loop pumps ensure we see ROI snapshot
-            t_settle = time.perf_counter() + 0.030  # 30 ms
-            while time.perf_counter() < t_settle:
+            # Let ROI settle; a few event loop pumps ensure we see ROI snapshot.
+            t_settle = time.perf_counter() + 0.030  # ~30 ms
+            while time.perf_counter() < t_settle and not self._want_stop:
                 QApplication.processEvents()
+                time.sleep(0)
 
             # Dwell collection
             dwell_t0 = time.perf_counter()
-            frames_collected = 0
-            # One-shot metadata for this dwell
             applied = self._applied_roi
             crop_abs = None  # (x, y, w, h) absolute top-left for software crop
-
-            # Clear accumulators for this dwell (they flush by chunk_len)
             self._reset_acc()
-
             self.progress.emit(
                 f"Spot {i+1}/{len(self.spots)} dwell {dwell_idx+1}: ROI={applied} r≈{r:.2f}"
             )
 
-            while (time.perf_counter() - dwell_t0) < max(0.05, float(self.cfg.dwell_sec)):
-                # Consume events and frames; _on_frame does the accumulation
+            while (time.perf_counter() - dwell_t0) < max(0.05, float(self.cfg.dwell_sec)) and not self._want_stop:
                 QApplication.processEvents()
-                frames_collected += 1
-                # First known crop_abs comes from the first accepted frame
+                time.sleep(0)  # yield a tick
                 if crop_abs is None and hasattr(self, "_last_crop_abs"):
                     crop_abs = getattr(self, "_last_crop_abs")
 
-                # Flush by chunk_len to avoid RAM growth
                 if len(self._acc_t) >= self.cfg.chunk_len:
-                    self._flush_chunk(i, dwell_idx, spot, applied, crop_abs)
+                    self._flush_chunk(i, dwell_idx, (cx, cy, r, area, inten), applied, crop_abs)
 
-            # Flush tail for this dwell
             if len(self._acc_t):
-                self._flush_chunk(i, dwell_idx, spot, applied, crop_abs)
+                self._flush_chunk(i, dwell_idx, (cx, cy, r, area, inten), applied, crop_abs)
 
             spot_idx += 1
             if spot_idx % len(self.spots) == 0:
@@ -252,42 +232,30 @@ class MultiSpotCycler(QObject):
         if a.ndim != 2 or a.size == 0:
             return
 
-        # Need a current target spot (derive from cycling order via time)
-        # We don't store which one here; the main loop does per-dwell flushes.
-        # Compute software crop like SpotViewer does.
         try:
-            # We need to know which spot we're currently centered on. Use the
-            # latest HW ROI snapshot and pick the nearest spot to its center.
             ax, ay, aw, ah = self._applied_roi
             if aw <= 0 or ah <= 0:
                 H, W = a.shape
                 ax = ay = 0; aw = W; ah = H
 
-            # camera view center in absolute coords
+            # choose closest configured spot to current view center
             vcx = ax + aw * 0.5
             vcy = ay + ah * 0.5
-
-            # choose closest spot (works because the set_roi puts the spot near center)
-            idx = int(np.argmin([
-                (s[0] - vcx) ** 2 + (s[1] - vcy) ** 2 for s in self.spots
-            ]))
+            idx = int(np.argmin([(s[0] - vcx) ** 2 + (s[1] - vcy) ** 2 for s in self.spots]))
             cx, cy, r, _area, _inten = self.spots[idx]
 
-            # Relative spot within the applied ROI
+            # Relative within the HW ROI
             rcx = float(cx) - float(ax)
             rcy = float(cy) - float(ay)
 
-            # Choose a display crop ~ 2r + a small context, even side for parity
+            # display crop
             r_eff = max(4.0, float(r))
-            diameter = max(2.0, 2.0 * r_eff)
-            want = int(math.ceil(diameter + 6.0))
-            side = int(max(10, min(aw, ah, want)))
-            if side % 2: side += 1
+            want = int(max(10, min(aw, ah, math.ceil(2.0 * r_eff + 6.0))))
+            side = want if (want % 2 == 0) else want + 1
 
             ix = max(0, min(aw - side, int(round(rcx)) - side // 2))
             iy = max(0, min(ah - side, int(round(rcy)) - side // 2))
 
-            # Clamp to actual frame
             H, W = a.shape
             ix = max(0, min(W - 2, ix)); iy = max(0, min(H - 2, iy))
             jx = max(ix + 1, min(W, ix + side))
@@ -295,28 +263,28 @@ class MultiSpotCycler(QObject):
 
             crop = a[iy:jy, ix:jx]
 
-            # Save displayed crop's absolute location
+            # track displayed crop absolute location
             crop_abs = (ax + ix, ay + iy, int(jx - ix), int(jy - iy))
-            self._last_crop_abs = crop_abs  # first dwell frame will pick this up
+            self._last_crop_abs = crop_abs
 
             # 4×pol means with correct parity
             row0 = (crop_abs[1]) & 1
             col0 = (crop_abs[0]) & 1
 
-            s90  = crop[row0::2,          col0::2]          # (0,0)
-            s45  = crop[row0::2,          (col0 ^ 1)::2]    # (0,1)
-            s135 = crop[(row0 ^ 1)::2,    col0::2]          # (1,0)
-            s0   = crop[(row0 ^ 1)::2,    (col0 ^ 1)::2]    # (1,1)
+            s90  = crop[row0::2,          col0::2]
+            s45  = crop[row0::2,          (col0 ^ 1)::2]
+            s135 = crop[(row0 ^ 1)::2,    col0::2]
+            s0   = crop[(row0 ^ 1)::2,    (col0 ^ 1)::2]
 
-            # Means as float64
-            m0   = float(s0.mean())   if s0.size   else 0.0
-            m45  = float(s45.mean())  if s45.size  else 0.0
-            m90  = float(s90.mean())  if s90.size  else 0.0
-            m135 = float(s135.mean()) if s135.size else 0.0
+            def mean_safe(x: np.ndarray) -> float:
+                return float(x.mean()) if x.size else 0.0
 
             t = time.perf_counter()
             self._acc_t.append(t)
-            self._acc0.append(m0); self._acc45.append(m45); self._acc90.append(m90); self._acc135.append(m135)
+            self._acc0.append(mean_safe(s0))
+            self._acc45.append(mean_safe(s45))
+            self._acc90.append(mean_safe(s90))
+            self._acc135.append(mean_safe(s135))
         except Exception:
             # swallow; keep cycling resilient
             return
@@ -350,29 +318,25 @@ class MultiSpotCycler(QObject):
         }
         jmeta = json.dumps(meta)
 
-        # Path
         sd = self._spot_dir(spot_i + 1)
         idx = self._chunk_idx.get(spot_i, 0)
         self._chunk_idx[spot_i] = idx + 1
         fname = os.path.join(sd, f"{self.cfg.base_name}_s{spot_i+1:02d}_d{dwell_i+1:04d}_p{idx:04d}.npz")
 
-        # Save
         np.savez_compressed(
             fname,
             t=t_rel, c0=c0, c45=c45, c90=c90, c135=c135,
             meta=np.frombuffer(jmeta.encode("utf-8"), dtype=np.uint8),
         )
-
         self.progress.emit(f"Saved {fname}  ({len(t_rel)} samples)")
         self._reset_acc()
 
     def _hw_roi_request_for_spot(self, cx: float, cy: float, r: float) -> Tuple[int, int, int, int]:
-        """Pick a *small* HW ROI, camera will snap (e.g., W→256)."""
-        # Keep generous width to tolerate snap; height min 32 often allowed
+        """Pick a *small* HW ROI; the camera will snap to supported steps."""
         side = int(max(32, math.ceil(2.2 * max(8.0, float(r)))))
         if side % 2: side += 1
-        req_w = max(64, side)   # camera may snap to 256 anyway
-        req_h = max(32, side // 2)  # keep fast short height
+        req_w = max(64, side)
+        req_h = max(32, side // 2)
         x = max(0, int(round(cx - req_w / 2.0)))
         y = max(0, int(round(cy - req_h / 2.0)))
         return (req_w, req_h, x, y)

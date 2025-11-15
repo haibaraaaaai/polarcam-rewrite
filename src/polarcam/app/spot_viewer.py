@@ -1,21 +1,20 @@
+# src/polarcam/app/spot_viewer.py
 from __future__ import annotations
-import math, os
+import math, os, time
 from typing import List, Tuple, Optional, TYPE_CHECKING
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread
-from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QStatusBar
-)
+from PySide6.QtWidgets import QMainWindow, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QStatusBar
 from PySide6.QtGui import QImage, QPixmap
 
 UI_CAP_MAX = 20.0  # preview cap (Hz)
 
-# ---- Type-only imports (for static checkers) ----
+# ---- Type-only imports ----
 if TYPE_CHECKING:
     from .spot_recorder import SpotSignalRecorder, RecorderConfig, Spot  # type: ignore[misc]
 
-# ---- Runtime-optional imports under distinct aliases ----
+# ---- Runtime-optional imports ----
 try:
     from .spot_recorder import (
         SpotSignalRecorder as SpotSignalRecorderRT,
@@ -44,7 +43,7 @@ class SpotViewerWindow(QMainWindow):
         spots: List[Tuple[float, float, float, int, int]],
         parent: Optional[QMainWindow] = None,
         index: int = 0,
-        **_ignored_kwargs,  # accepts saved_roi, saved_fps, etc., for back-compat
+        **_ignored_kwargs,
     ):
         super().__init__(parent)
         self.setWindowTitle("Spot viewer — passive preview (≤20 Hz) + optional recorder")
@@ -109,16 +108,16 @@ class SpotViewerWindow(QMainWindow):
         self._applied_roi = (0, 0, 0, 0)  # (x, y, w, h)
         self._fps_now = 20.0
         self._ui_cap = UI_CAP_MAX
-        self._latest = None  # np.ndarray | None
+        self._latest = None  # np.ndarray
 
         # UI tick timer (decoupled from frame rate)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._ui_tick)
         self._timer.start(int(1000.0 / self._ui_cap))
 
-        # Recorder bits (type-only name is quoted to avoid the “variable in type” error)
+        # Recorder bits
         self._rec_thread: Optional[QThread] = None
-        self._rec: Optional['SpotSignalRecorder'] = None  # <- note the quotes
+        self._rec: Optional['SpotSignalRecorder'] = None  # type-only name quoted
 
         self._update_cap()
 
@@ -172,11 +171,8 @@ class SpotViewerWindow(QMainWindow):
         rcy = float(cy) - float(ay)
 
         r_eff = max(4.0, float(r))
-        diameter = max(2.0, 2.0 * r_eff)
-        want = int(math.ceil(diameter + 6))   # a little context
-        side = int(max(10, min(aw, ah, want)))
-        if side % 2:
-            side += 1  # even side helps mosaic parity
+        want = int(max(10, min(aw, ah, math.ceil(2.0 * r_eff + 6))))
+        side = want if (want % 2 == 0) else want + 1
 
         ix = max(0, min(aw - side, int(round(rcx)) - side // 2))
         iy = max(0, min(ah - side, int(round(rcy)) - side // 2))
@@ -187,12 +183,11 @@ class SpotViewerWindow(QMainWindow):
         jy = max(iy + 1, min(H, iy + side))
 
         crop = a[iy:jy, ix:jx]
-
         a8 = (crop >> 4).astype(np.uint8) if crop.dtype == np.uint16 else crop.astype(np.uint8, copy=False)
         if not a8.flags.c_contiguous:
             a8 = np.ascontiguousarray(a8)
         h, w = a8.shape
-        qimg = QImage(a8.data, w, h, w, QImage.Format_Grayscale8)
+        qimg = QImage(a8.data, w, h, w, QImage.Format_Grayscale8).copy()  # copy to own memory
         self.video.setPixmap(QPixmap.fromImage(qimg))
 
     # ---- navigation ----
@@ -233,7 +228,7 @@ class SpotViewerWindow(QMainWindow):
         self._rec.moveToThread(self._rec_thread)
 
         self._rec_thread.started.connect(self._rec.start)
-        self._rec.progress.connect(lambda n: self.status.showMessage(f"Recording… {n} samples", 1000))
+        self._rec.progress.connect(lambda n: (self.status.showMessage(f"Recording… {n} samples", 1000), self.rec_progress.emit(n)))
         self._rec.error.connect(lambda msg: self.status.showMessage(f"Recorder error: {msg}", 4000))
         self._rec.stopped.connect(self._rec_thread.quit)
 
@@ -279,7 +274,6 @@ class SpotViewerWindow(QMainWindow):
         try: self._stop_rec()
         except Exception: pass
         super().closeEvent(e)
-
 
 # Back-compat alias
 SpotViewerDialog = SpotViewerWindow

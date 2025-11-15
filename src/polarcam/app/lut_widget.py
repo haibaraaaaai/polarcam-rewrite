@@ -4,8 +4,8 @@ from __future__ import annotations
 from typing import Iterable, Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF
-from PySide6.QtGui import QPainter, QPen, QBrush, QLinearGradient, QMouseEvent, QWheelEvent, QPaintEvent, QCursor
+from PySide6.QtCore import Qt, Signal, QRectF
+from PySide6.QtGui import QPainter, QPen, QBrush, QLinearGradient, QMouseEvent, QWheelEvent, QPaintEvent, QCursor, QImage, QPixmap
 from PySide6.QtWidgets import QWidget
 
 
@@ -13,20 +13,23 @@ class HighlightLUTWidget(QWidget):
     """
     Lightweight highlight-LUT control with drag handles.
 
-    - Drag LEFT handle = black floor (12-bit, 0..4095)
-    - Drag RIGHT handle = white cap   (12-bit, 0..4095)
-    - Hold CTRL + mouse wheel = adjust gamma
-    - Double-click = reset to defaults (floor=3000, cap=4095, gamma=0.6)
+    Interactions
+    ------------
+    • Drag LEFT handle  → black floor (12-bit, 0..4095)
+    • Drag RIGHT handle → white cap   (12-bit, 0..4095)
+    • Hold CTRL + mouse wheel → adjust gamma
+    • Double-click → reset to defaults (floor=3000, cap=4095, gamma=0.6)
 
-    Emits:
-        paramsChanged(int floor, int cap, float gamma)
-            Fired on ANY interactive change (drag/wheel/double-click).
+    Signals
+    -------
+    paramsChanged(int floor, int cap, float gamma)
 
-    API:
-        setParams(floor, cap, gamma)
-        params() -> (floor, cap, gamma)
-        setHistogram256(hist)  # optional 256 bins over 0..4095
-        build_lut() -> np.ndarray shape (4096,), dtype uint8
+    API
+    ---
+    setParams(floor, cap, gamma)
+    params() -> (floor, cap, gamma)
+    setHistogram256(hist)  # optional 256 bins over 0..4095
+    build_lut() -> np.ndarray shape (4096,), dtype uint8
     """
 
     paramsChanged = Signal(int, int, float)  # floor, cap, gamma
@@ -91,9 +94,7 @@ class HighlightLUTWidget(QWidget):
         x = np.arange(4096, dtype=np.float32)
         f, c, g = float(self._floor), float(self._cap), float(self._gamma)
         denom = max(1.0, c - f)
-        t = (x - f) / denom
-        t = np.clip(t, 0.0, 1.0)
-        # gamma: emphasize highlights when g < 1; compress highlights when g > 1
+        t = np.clip((x - f) / denom, 0.0, 1.0)
         y = np.power(t, g) * 255.0
         return y.astype(np.uint8)
 
@@ -103,11 +104,9 @@ class HighlightLUTWidget(QWidget):
         bx = self._x_for_value(self._floor)
         wx = self._x_for_value(self._cap)
         if abs(x - bx) < self._handle_snap_px:
-            self._drag = "black"
-            self.setCursor(QCursor(Qt.SizeHorCursor))
+            self._drag = "black"; self.setCursor(QCursor(Qt.SizeHorCursor))
         elif abs(x - wx) < self._handle_snap_px:
-            self._drag = "white"
-            self.setCursor(QCursor(Qt.SizeHorCursor))
+            self._drag = "white"; self.setCursor(QCursor(Qt.SizeHorCursor))
         else:
             self._drag = None
         super().mousePressEvent(e)
@@ -151,10 +150,13 @@ class HighlightLUTWidget(QWidget):
         super().mouseDoubleClickEvent(e)
 
     def wheelEvent(self, e: QWheelEvent) -> None:
-        # Ctrl+wheel to adjust gamma smoothly
+        # Ctrl+wheel to adjust gamma smoothly; support high-res touchpads.
         if e.modifiers() & Qt.ControlModifier:
-            delta_steps = e.angleDelta().y() / 120.0  # one notch ≈ 120
-            g = self._gamma * (1.0 + delta_steps * self._gamma_wheel_scale)
+            delta = e.angleDelta().y()
+            if not delta and e.pixelDelta().y():
+                delta = e.pixelDelta().y() / 15.0  # rough scale to "steps"
+            delta_steps = delta / 120.0
+            g = self._gamma * (1.0 + float(delta_steps) * self._gamma_wheel_scale)
             self._gamma = float(max(0.05, min(g, 10.0)))
             self.paramsChanged.emit(self._floor, self._cap, self._gamma)
             self.update()
@@ -193,9 +195,10 @@ class HighlightLUTWidget(QWidget):
             bw = bar_rect.width() / 256.0
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(Qt.darkGray))
+            top = bar_rect.bottom()
             for i, v in enumerate(self._hist):
                 h = (float(v) / mx) * self._hist_h
-                p.drawRect(QRectF(bar_rect.left() + i * bw, bar_rect.bottom() - h, bw, h))
+                p.drawRect(bar_rect.left() + i * bw, top - h, bw, h)
 
         # gradient bar
         grad = QLinearGradient(bar_rect.left(), 0, bar_rect.right(), 0)
@@ -207,13 +210,10 @@ class HighlightLUTWidget(QWidget):
         bx = self._x_for_value(self._floor)
         wx = self._x_for_value(self._cap)
         dim = QBrush(Qt.black)
-        dim_pen = QPen(Qt.NoPen)
-        dim_rect_left = QRectF(bar_rect.left(), bar_rect.top(), max(0.0, bx - bar_rect.left()), bar_rect.height())
-        dim_rect_right = QRectF(wx, bar_rect.top(), max(0.0, bar_rect.right() - wx), bar_rect.height())
-        p.setPen(dim_pen)
+        p.setPen(Qt.NoPen)
         p.setOpacity(0.4)
-        p.fillRect(dim_rect_left, dim)
-        p.fillRect(dim_rect_right, dim)
+        p.fillRect(bar_rect.left(), bar_rect.top(), max(0.0, bx - bar_rect.left()), bar_rect.height(), dim)
+        p.fillRect(wx, bar_rect.top(), max(0.0, bar_rect.right() - wx), bar_rect.height(), dim)
         p.setOpacity(1.0)
 
         # handles

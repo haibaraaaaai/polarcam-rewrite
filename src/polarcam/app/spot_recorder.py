@@ -1,3 +1,4 @@
+# src/polarcam/app/spot_recorder.py
 from __future__ import annotations
 import os, json, math, time, threading
 from dataclasses import dataclass
@@ -10,9 +11,7 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
 # Polar mosaic layout:
 # (row%2, col%2): (0,0)=90°, (0,1)=45°, (1,0)=135°, (1,1)=0°
 
-# --------------------------
-# small utils
-# --------------------------
+# -------------------------- small utils --------------------------
 def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
@@ -23,9 +22,7 @@ def _round_up(v: int, step: int) -> int:
 def _snap_even(v: int) -> int:
     return int(v if (int(v) % 2 == 0) else int(v) + 1)
 
-# --------------------------
-# IDS-ish ROI constraints (edit if different)
-# --------------------------
+# -------------------------- ROI constraints (tune for camera) --------------------------
 W_STEP = 16
 H_STEP = 2
 MIN_W  = 64
@@ -36,9 +33,7 @@ MIN_CROP = 10     # minimum crop side (even)
 
 DEFAULT_CHUNK = 20000  # samples per shard
 
-# --------------------------
-# dataclasses
-# --------------------------
+# -------------------------- dataclasses --------------------------
 @dataclass
 class Spot:
     cx: float
@@ -54,9 +49,7 @@ class RecorderConfig:
     chunk_len: int = DEFAULT_CHUNK
     maximize_camera_fps: bool = True   # set_timing(inf, None)
 
-# --------------------------
-# shard writer (own thread)
-# --------------------------
+# -------------------------- shard writer (own thread) --------------------------
 class _ShardWriter(QObject):
     finished = Signal()
     error = Signal(str)
@@ -102,10 +95,14 @@ class _ShardWriter(QObject):
         finally:
             self.finished.emit()
 
-# --------------------------
-# headless recorder
-# --------------------------
+# -------------------------- headless recorder --------------------------
 class SpotSignalRecorder(QObject):
+    """
+    Background recorder:
+    - Shrinks HW ROI around the spot
+    - Runs camera at max FPS (optional)
+    - Saves mean 4×pol signals in chunked .npy shards
+    """
     started = Signal()
     stopped = Signal()
     error = Signal(str)
@@ -143,8 +140,6 @@ class SpotSignalRecorder(QObject):
         self.cam.roi.connect(self._on_roi, Qt.QueuedConnection)
         self.cam.frame.connect(self._on_frame, Qt.QueuedConnection)
 
-        self._saved_roi = None  # best-effort restore
-        self._saved_fps = None
         self._running = False
         self._t0 = 0.0
 
@@ -184,16 +179,21 @@ class SpotSignalRecorder(QObject):
         self.started.emit()
 
     def stop(self) -> None:
-        if not self._running: return
+        if not self._running:
+            return
         self._running = False
-        # flush
+        # flush any remainder
         try:
             if self._buf_i > 0:
                 self._writer.enqueue(self._buf[:self._buf_i].copy())
                 self._buf_i = 0
-        except Exception: pass
-        try: self._writer.close()
-        except Exception: pass
+        except Exception:
+            pass
+        try:
+            self._writer.close()
+        finally:
+            # ensure the writer thread finishes so we don't leak
+            self._writer_thr.wait(3000)
         self.stopped.emit()
 
     # ---- camera reports ----

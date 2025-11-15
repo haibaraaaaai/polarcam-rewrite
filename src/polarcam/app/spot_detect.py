@@ -1,3 +1,4 @@
+# src/polarcam/app/spot_detect.py
 from __future__ import annotations
 from typing import List, Tuple
 import numpy as np
@@ -31,7 +32,6 @@ def _remove_small_objects(mask: np.ndarray, min_area: int) -> np.ndarray:
     if not kill:
         return mask
     out = mask.copy()
-    # zero labels to be removed
     for k in kill:
         out[lab == k] = False
     return out
@@ -42,22 +42,22 @@ def detect_spots_oneframe(
     *,
     thr_mode: str = "absolute",   # "absolute" (DN) or "percentile"
     thr_value: float = 1200.0,    # DN or [0..100] percentile
-    min_area: int = 6,            # px (match previous defaults better)
+    min_area: int = 6,            # px
     max_area: int = 5000,         # px
-    open_radius: int = 2,         # px — like the previous app (de-speckle first)
-    close_radius: int = 1,        # px — mend tiny gaps
+    open_radius: int = 2,         # px
+    close_radius: int = 1,        # px
     remove_border: bool = True,
     debug: bool = False,
 ) -> List[Spot]:
     """
-    Old detection logic adapted to a *single* frame:
+    Single-frame detection:
 
       1) threshold on intensity (absolute or percentile)
-      2) binary opening (disk=2)
-      3) remove small objects (min_area)
-      4) binary closing (disk=1)
+      2) binary opening (de-speckle)
+      3) remove small objects
+      4) binary closing (mend tiny gaps)
       5) label (4-connectivity), compute centroid + area
-      6) radius r = sqrt(area / pi), intensity from frame at rounded centroid
+      6) radius r = sqrt(area / pi), intensity from original frame at rounded centroid
     """
     a = img16.astype(np.uint16, copy=False)
     H, W = a.shape
@@ -87,15 +87,14 @@ def detect_spots_oneframe(
     if close_radius > 0:
         mask = ndi.binary_closing(mask, structure=_disk(close_radius))
 
-    # --- 5) label + props (SciPy-only) ---
+    # --- 5) label + props ---
     lab, n = ndi.label(mask, structure=np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8))
     if n == 0:
         if debug:
-            print(f"[Detect] HxW={H}x{W}  mode={mode_str}  thr={t:.1f}  pixels>thr=0")
+            print(f"[Detect] {H}x{W}  mode={mode_str}  thr={t:.1f}  pixels>thr=0")
         return []
 
     areas = ndi.sum(mask, labels=lab, index=np.arange(1, n + 1)).astype(np.int64)
-    # center of mass on the *binary* mask (unweighted), same as regionprops centroid
     centers = ndi.center_of_mass(mask, lab, index=np.arange(1, n + 1))
     boxes = ndi.find_objects(lab)
 
@@ -110,27 +109,20 @@ def detect_spots_oneframe(
         r0, r1 = sl[0].start, sl[0].stop
         c0, c1 = sl[1].start, sl[1].stop
         if remove_border and (r0 <= 0 or c0 <= 0 or r1 >= H or c1 >= W):
-            # still touching border → skip
             continue
 
-        cy, cx = centers[i]  # note: center_of_mass returns (row, col)
-        # intensity from original frame at rounded centroid
+        cy, cx = centers[i]  # center_of_mass returns (row, col)
         iy, ix = int(round(cy)), int(round(cx))
         iy = max(0, min(H - 1, iy))
         ix = max(0, min(W - 1, ix))
         inten = int(a[iy, ix])
 
-        # radius from area
         r = float(np.sqrt(max(1.0, float(area)) / np.pi))
-        out.append((float(cx), float(cy), r, int(area), int(inten)))
+        out.append((float(ix), float(iy), r, int(area), int(inten)))
 
-    if not out:
-        if debug:
-            print(f"[Detect] HxW={H}x{W}  mode={mode_str}  thr={t:.1f}  pixels>thr={int(mask.sum())}  spots=0")
-        return []
-
-    # sort bright-first (as before)
-    out.sort(key=lambda z: -z[4])
     if debug:
-        print(f"[Detect] spots={len(out)}  min/max area={min(a for *_, a, __ in [(*s[:4], s[3]) for s in out]):d}/{max(s[3] for s in out):d}")
+        print(f"[Detect] spots={len(out)}  mode={mode_str}  thr={t:.1f}  px>thr={int(mask.sum())}")
+
+    # bright-first
+    out.sort(key=lambda z: -z[4])
     return out

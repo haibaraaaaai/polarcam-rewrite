@@ -61,7 +61,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Configure logging first, then bridge Qt messages into it.
     logger = setup_logging(verbosity=args.verbose, logfile=args.log_file)
 
-    app = QApplication(argv or sys.argv)
+    app = QApplication(sys.argv if argv is None else argv)
     app.setApplicationName(__app_name__)
     app.setApplicationVersion(__version__)
     app.setOrganizationName("BFM Lab")

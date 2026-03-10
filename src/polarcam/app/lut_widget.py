@@ -5,7 +5,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QRectF
-from PySide6.QtGui import QPainter, QPen, QBrush, QLinearGradient, QMouseEvent, QWheelEvent, QPaintEvent, QCursor, QImage, QPixmap
+from PySide6.QtGui import QPainter, QPen, QBrush, QLinearGradient, QMouseEvent, QWheelEvent, QPaintEvent, QCursor
 from PySide6.QtWidgets import QWidget
 
 

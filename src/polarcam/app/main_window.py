@@ -151,6 +151,9 @@ class MainWindow(QMainWindow):
         self.btn_clear_overlays.clicked.connect(self._clear_overlays)
         self.btn_view_spot.clicked.connect(self._view_selected_spots)
         self.btn_remove_spot.clicked.connect(self._remove_selected_spots)
+        self.btn_add_spot.clicked.connect(self._add_spot_manual)
+        for _ed in (self.ed_add_cx, self.ed_add_cy, self.ed_add_r):
+            _ed.textChanged.connect(self._update_add_spot_preview)
         self.btn_record_start.clicked.connect(self._start_record_clicked)
         self.btn_record_stop.clicked.connect(self._stop_record_clicked)
         self.btn_record_browse.clicked.connect(self._browse_record_dir)
@@ -168,6 +171,9 @@ class MainWindow(QMainWindow):
 
         self._roi_offset = (0, 0)   # (OffsetX, OffsetY)
         self._roi_size = (0, 0)     # (Width, Height)
+
+        # preview circle for manual add-spot
+        self._preview_spot: Optional[Tuple[float, float, float]] = None  # (cx_local, cy_local, r)
 
         # histogram rate-limiting
         self._hist_t_last = 0.0
@@ -364,8 +370,35 @@ class MainWindow(QMainWindow):
         self.spot_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.btn_view_spot = QPushButton("View spot…")
         self.btn_remove_spot = QPushButton("Remove selected")
+
+        # Manual add spot
+        add_form = QHBoxLayout()
+        self.ed_add_cx = QLineEdit(); self.ed_add_cx.setPlaceholderText("cx")
+        self.ed_add_cy = QLineEdit(); self.ed_add_cy.setPlaceholderText("cy")
+        self.ed_add_r  = QLineEdit(); self.ed_add_r.setPlaceholderText("r")
+        dv = QDoubleValidator(0.0, 100000.0, 2, self); dv.setNotation(QDoubleValidator.StandardNotation)
+        for ed in (self.ed_add_cx, self.ed_add_cy, self.ed_add_r):
+            ed.setValidator(dv); ed.setMaximumWidth(60)
+        self.btn_add_spot = QPushButton("Add spot")
+        add_form.addWidget(QLabel("cx")); add_form.addWidget(self.ed_add_cx)
+        add_form.addWidget(QLabel("cy")); add_form.addWidget(self.ed_add_cy)
+        add_form.addWidget(QLabel("r"));  add_form.addWidget(self.ed_add_r)
+        add_form.addWidget(self.btn_add_spot)
+
         # Cycle controls
-        self.btn_cycle_start = QPushButton("Start Cycle (1 s / spot)")
+        self.chk_cycle_save = QCheckBox("Save cycle data")
+        self.chk_cycle_save.setChecked(True)
+        self.chk_cycle_raw = QCheckBox("Save raw pixels")
+        self.chk_cycle_raw.setChecked(False)
+        dwell_row = QHBoxLayout()
+        dwell_row.addWidget(QLabel("Dwell (s)"))
+        self.ed_cycle_dwell = QLineEdit("1.0")
+        dv2 = QDoubleValidator(0.01, 3600.0, 2, self); dv2.setNotation(QDoubleValidator.StandardNotation)
+        self.ed_cycle_dwell.setValidator(dv2)
+        self.ed_cycle_dwell.setMaximumWidth(60)
+        dwell_row.addWidget(self.ed_cycle_dwell)
+        dwell_row.addStretch(1)
+        self.btn_cycle_start = QPushButton("Start Cycle")
         self.btn_cycle_stop  = QPushButton("Stop Cycle")
         self.btn_cycle_stop.setEnabled(False)
 
@@ -374,6 +407,10 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_remove_spot)
         v.addWidget(self.spot_list, 1)
         v.addLayout(row)
+        v.addLayout(add_form)
+        v.addLayout(dwell_row)
+        v.addWidget(self.chk_cycle_save)
+        v.addWidget(self.chk_cycle_raw)
         v.addWidget(self.btn_cycle_start)
         v.addWidget(self.btn_cycle_stop)
         self._form.addRow(box)
@@ -485,7 +522,9 @@ class MainWindow(QMainWindow):
         qimg = QImage(a8.data, w, h, w, QImage.Format_Grayscale8)
         pm = QPixmap.fromImage(qimg.copy())  # own memory for safety
 
-        if not self._spots:
+        has_spots = bool(self._spots)
+        has_preview = self._preview_spot is not None
+        if not has_spots and not has_preview:
             return pm
 
         from PySide6.QtGui import QColor
@@ -517,6 +556,19 @@ class MainWindow(QMainWindow):
             if 0 <= cx < w and 0 <= cy < h:
                 p.drawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
                 p.drawText(cx + rr + 3, cy - rr - 2, f"{i + 1}")
+
+        # Preview circle for manual add-spot (cyan, dashed)
+        if has_preview:
+            pcx, pcy, pr = self._preview_spot
+            px_i = int(round(pcx))
+            py_i = int(round(pcy))
+            pr_i = max(1, int(round(pr)))
+            if 0 <= px_i < w and 0 <= py_i < h:
+                pen = QPen(QColor(0, 200, 255), 2, Qt.DashLine)
+                p.setPen(pen)
+                p.drawEllipse(px_i - pr_i, py_i - pr_i, 2 * pr_i, 2 * pr_i)
+                p.drawText(px_i + pr_i + 3, py_i - pr_i - 2, "?")
+
         p.end()
         return pm
 
@@ -688,6 +740,15 @@ class MainWindow(QMainWindow):
                 r_uniformity_threshold=p.get("r_uniformity_threshold", 0.05),
             )
             self._frame_buf = []  # free memory
+
+            # Convert ROI-local coords to full-sensor coords so spots
+            # remain valid even if the hardware ROI changes later.
+            ox, oy = self._roi_offset
+            if ox or oy:
+                for s in spots:
+                    s.cx += ox
+                    s.cy += oy
+
             self.detect_done.emit(("ok", spots))
         except Exception as e:
             try:
@@ -743,13 +804,13 @@ class MainWindow(QMainWindow):
         self._spots = visible
         self.spot_list.clear()
 
-        LABEL_SYM = {"partial": "\u2717", "irregular spinner": "\u25ce", "good spinner": "\u2713"}
+        LABEL_SYM = {"partial": "\u2717", "irregular spinner": "\u25ce", "good spinner": "\u2713", "manual": "+"}
         for i, s in enumerate(self._spots):
             sym = LABEL_SYM.get(s.label, "?")
             smr = f"{s.std_median_r:.4f}" if np.isfinite(s.std_median_r) else "n/a"
             item = QListWidgetItem(
                 f"#{i+1} {sym} {s.label}  (x={s.cx:.1f}, y={s.cy:.1f})  "
-                f"r\u2248{s.r:.1f}px  \u03c6={s.phi_cov:.2f}  \u03c3r={smr}"
+                f"r\u2248{s.r:.1f}px  \u03c6={s.phi_cov*100:.0f}%  \u03c3r={smr}"
             )
             self.spot_list.addItem(item)
 
@@ -885,19 +946,66 @@ class MainWindow(QMainWindow):
         self._all_spots = [s for s in self._all_spots if id(s) not in to_remove]
         self._refresh_spot_list()
 
+    def _update_add_spot_preview(self) -> None:
+        """Update the preview circle whenever add-spot fields change."""
+        try:
+            cx = float(self.ed_add_cx.text())
+            cy = float(self.ed_add_cy.text())
+            r = float(self.ed_add_r.text())
+            if r > 0:
+                self._preview_spot = (cx, cy, r)
+            else:
+                self._preview_spot = None
+        except (ValueError, TypeError):
+            self._preview_spot = None
+
+    def _add_spot_manual(self) -> None:
+        """Add a spot from the cx/cy/r text fields. Coords are ROI-local."""
+        try:
+            cx_local = float(self.ed_add_cx.text())
+            cy_local = float(self.ed_add_cy.text())
+            r = float(self.ed_add_r.text())
+        except (ValueError, TypeError):
+            self.status.showMessage("Add spot: enter valid cx, cy, r.", 2500)
+            return
+        if r <= 0:
+            self.status.showMessage("Add spot: radius must be > 0.", 2500)
+            return
+        # Convert ROI-local → full-sensor coords
+        ox, oy = self._roi_offset
+        cx_abs = cx_local + ox
+        cy_abs = cy_local + oy
+        spot = DetectedSpot(
+            cx=cx_abs, cy=cy_abs, r=r,
+            label="manual", phi_cov=0.0, std_median_r=float('inf'),
+        )
+        self._all_spots.append(spot)
+        self._refresh_spot_list()
+        self.status.showMessage(
+            f"Added manual spot at sensor ({cx_abs:.1f}, {cy_abs:.1f}) r={r:.1f}", 3000
+        )
+
     # ---------- CYCLE: start/stop threads ----------
     def _start_cycle_clicked(self) -> None:
         if not self._spots:
             QMessageBox.information(self, "Cycle", "No spots selected/detected.")
             return
         out_dir = os.path.join(os.getcwd(), "cycles")
+        save_on = self.chk_cycle_save.isChecked()
+        raw_on = self.chk_cycle_raw.isChecked()
+        try:
+            dwell = max(0.01, float(self.ed_cycle_dwell.text()))
+        except Exception:
+            dwell = 1.0
         cfg = CycleConfig(
             out_dir=out_dir,
             base_name="cycle",
-            dwell_sec=1.0,
+            dwell_sec=dwell,
             max_duration_sec=3600,
             chunk_len=20000,
             maximize_camera_fps=True,
+            save_enabled=save_on,
+            save_raw=raw_on,
         )
 
         if self._cycle_thread is not None:
@@ -914,12 +1022,6 @@ class MainWindow(QMainWindow):
         self._cycle_thread = QThread(self)
         self._cycler = cycler
         self._cycler.moveToThread(self._cycle_thread)
-
-        # signals
-        try:
-            self._cycler.advise_ui_cap.connect(self._on_cycle_ui_cap)
-        except Exception:
-            pass  # older builds without the signal
 
         # signals
         self._cycle_thread.started.connect(self._cycler.start,       Qt.QueuedConnection)
@@ -939,12 +1041,10 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Cycle started — recording at max FPS, preview capped at 20 FPS.", 4000)
 
     def _stop_cycle_clicked(self) -> None:
-        # User stop
+        # User stop — don't block the GUI thread; _cycle_finished runs on 'finished' signal
         if self._cycler:
             try: self._cycler.stop()
             except Exception: pass
-        if self._cycle_thread:
-            self._cycle_thread.wait(3000)  # join
 
     def _cycle_finished(self) -> None:
         # Thread finished
@@ -1070,16 +1170,6 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
         self._refresh_video_view()
-
-    @Slot(float)
-    def _on_cycle_ui_cap(self, hz: float) -> None:
-        """Failsafe UI preview cap while the cycler runs (recording stays max FPS)."""
-        if hz and hz > 0:
-            self._preview_cap_fps = float(hz)
-            self._last_preview_t = 0.0
-            self._cycle_active = True
-        else:
-            self._cycle_active = False
 
     # ---- TEST ONLY — delete this entire method block to clean up ----
     def _load_avi_test(self) -> None:

@@ -1,42 +1,30 @@
-Here's a clean checklist based on everything we've discussed. I've grouped them into logical phases so you can work top-to-bottom.
+# PolarCam — TODO / roadmap
+
+> Phases 1–4 complete. Below is what's left to revisit.
 
 ---
 
-## Polarcam Rewrite — Work Checklist
+## Analysis / reconstruction (offline first, then live)
 
-### Phase 1 — Spot Detection
-- [ ] **1.1** Replace `spot_detect.py` (single-frame intensity threshold) with S-map based detection from Hugh's approach
-- [ ] **1.2** Add `pol_reconstruction.py` — the intersection-grid `make_xy_reconstructor` / `make_qu_reconstructor` (only needed for detection, lives in `analysis/`)
-- [ ] **1.3** Add `analysis/smap.py` — S-map computation: per-frame smooth x,y → track min/max → `S = range(x)² + range(y)²`
-- [ ] **1.4** Add `analysis/detect.py` — DoG + connected components on S-map (extracted from Hugh's `detect_spinners.py`)
-- [ ] **1.5** Wire detection into the GUI — expose tunable parameters (k_std, min/max area, N frames) as GUI controls
+- [ ] **Background / flat-field correction** — subtract dark frame and divide by flat-field before channel extraction. Acquire calibration frames (lens-cap dark, uniform illumination flat) and store as `.npy`. Apply correction in `pol_reconstruction` or a new `calibration.py` module.
+- [ ] **θ and φ reconstruction (Fourkas)** — implement the Fourkas formulae to extract polar angle θ and azimuthal angle φ from the four polarization channels. Start as an offline script on saved raw-pixel data, then integrate into the live spot viewer once validated.
+- [ ] **PSD-based θ estimation** — compute per-spot power spectral density of the anisotropy signal; extract θ from the modulation depth / DC ratio. Useful as a cross-check against Fourkas.
 
-### Phase 2 — Data Saving
-- [ ] **2.1** Remove `capture/varmap_capture.py` and `analysis/varmap.py` — not needed
-- [ ] **2.2** Investigate IDS camera native save commands (check `ids_peak` API for hardware-triggered recording)
-- [ ] **2.3** If no native save: implement a simple frame-to-disk writer (memmap or chunked `.npy`) — stripped down version of what `fetch_frames.py` does but as a proper `QObject` subscriber like `_ShardWriter` in `spot_recorder.py`
+## Code quality
 
-### Phase 3 — Per-Spot Analysis Display
-- [ ] **3.1** Per-spot XY time series extraction — window mean per confirmed spot, per frame (as Hugh does in `_append_xy_from_frame`)
-- [ ] **3.2** Compute φ(t) = ½ arctan2(y, x) and r(t) = √(x²+y²) per spot from time series
-- [ ] **3.3** Build compact spot analysis panel — small inline display (not full-screen takeover), shows XY scatter + φ(t) trace at minimum
-- [ ] **3.4** Hook panel into spot cycler — update display as cycler dwells on each spot
+- [ ] **Split `main_window.py` into mixins** — at ~1300 lines it handles video, detection, recording, cycling, and spot management. Extract into focused mixins or helper classes (e.g. `_CycleMixin`, `_DetectMixin`, `_RecordMixin`) that the main window composes.
+- [ ] **Deduplicate ROI-for-spot logic** — `spot_cycler._hw_roi_request_for_spot`, `spot_recorder._roi_for_spot`, and `spot_viewer._set_spot_roi` are near-identical. Extract a shared `roi_for_spot(cx, cy, r)` into `hardware.py`.
+- [ ] **Unify `Spot` vs `DetectedSpot`** — `spot_recorder.Spot(cx, cy, r, area, inten)` and `spot_detect.DetectedSpot(cx, cy, r, label, phi_cov, std_median_r)` represent the same concept with different fields. Consider a single dataclass.
 
-### Phase 4 — Spot Cycler Improvements
-- [ ] **4.1** Manual spot add — click on live view to add a spot by hand
-- [ ] **4.2** Manual spot remove — select and delete a spot from the list
-- [ ] **4.3** Auto-inspect trigger — after S-map detection, automatically run a short high-fps burst per confirmed spot (like Hugh's `_auto_inspect_top_spots`)
-- [ ] **4.4** XY range filter — post-dwell filter to drop confirmed-dead spots (no anisotropy movement) from the cycle list
+## UX / live features
 
-### Phase 5 — Deferred / Optional
-- [ ] **5.1** Background / flat-field correction — skip for now, revisit later
-- [ ] **5.2** θ reconstruction from r — add Fourkas formula once φ pipeline is validated
-- [ ] **5.3** PSD-based directionality (Hugh's `DIR_*` parameters) — revisit after basic φ works
+- [ ] **XY-range auto-prune** — after each dwell, check if a spot shows zero anisotropy movement and optionally drop it from the cycle list.
+- [ ] **Live FFT / peak-finder** — add a frequency-domain readout to the spot viewer scatter plot.
+- [ ] **Per-spot exposure in cycler** — allow different exposure times per spot during cycling (useful when spots have very different brightness).
+- [ ] **Clearer state indicators** — started/paused/recording badges in the toolbar; progress bar for long operations.
 
----
+## Infrastructure
 
-Things to note before starting:
-
-- **Phase 1 is a prerequisite for everything else** — until you have the S-map and DoG working, the spot list that the cycler and analysis panel depend on doesn't exist.
-- **Phase 2 can be done independently** at any point, it doesn't block other phases.
-- **Phase 3 and 4 are interleaved** — the display panel and the cycler improvements should be built together since they share the per-spot time series data.
+- [ ] **PyInstaller packaging** — one-folder app bundle with IDS DLLs included.
+- [ ] **Condition.wait() timeouts** — the shard-writer threads in `frame_writer.py` and `spot_recorder.py` use `Condition.wait()` with no timeout; add a timeout so threads don't hang on crash.
+- [ ] **Mock backend ROI signals** — `AviMockCamera` silently no-ops ROI/timing calls; the cycler's `_applied_roi` never updates. Emit synthetic `roi` signals so cycling works in test mode.

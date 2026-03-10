@@ -29,6 +29,8 @@ from typing import Deque, Optional
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
+from polarcam.hardware import MOSAIC_LAYOUT_STR
+
 
 # ---------------------------------------------------------------------------
 # Background shard writer
@@ -184,7 +186,7 @@ class FrameWriter(QObject):
             "fps_configured": self._fps_configured,
             "chunk_len": self._chunk_len,
             "mosaic_layout": {
-                "(row%2, col%2)": {"(0,0)": "90°", "(0,1)": "45°", "(1,0)": "135°", "(1,1)": "0°"}
+                "(row%2, col%2)": MOSAIC_LAYOUT_STR
             },
         }
         try:

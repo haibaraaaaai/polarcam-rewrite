@@ -7,20 +7,11 @@ from typing import List, Tuple, Optional
 import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot, Qt
 
-# Polar mosaic: (0,0)=90°, (0,1)=45°, (1,0)=135°, (1,1)=0°
-
-# ---- Hardware limits (your camera) ----
-SENSOR_W, SENSOR_H = 2464, 2056
-STEP_W, STEP_H     = 4, 2
-MIN_W,  MIN_H      = 256, 2
-MAX_W,  MAX_H      = SENSOR_W, SENSOR_H
-OFFX_MIN, OFFX_MAX = 0, 2208                 # 2464 - 256
-OFFY_MIN, OFFY_MAX = 0, 2054
-OFFX_STEP, OFFY_STEP = 4, 2
-
-def _snap_down(v: int, step: int) -> int:
-    s = int(step) if step > 0 else 1
-    return int((int(v) // s) * s)
+from polarcam.hardware import (
+    SENSOR_W, SENSOR_H, STEP_W, STEP_H, MIN_W, MIN_H, MAX_W, MAX_H,
+    OFFX_MIN, OFFX_MAX, OFFY_MIN, OFFY_MAX, OFFX_STEP, OFFY_STEP,
+    MOSAIC_LAYOUT, MOSAIC_LAYOUT_STR, snap_down,
+)
 
 @dataclass
 class CycleConfig:
@@ -31,6 +22,8 @@ class CycleConfig:
     chunk_len: int = 20000
     maximize_camera_fps: bool = True
     reassert_timing_each_hop: bool = True
+    save_enabled: bool = True
+    save_raw: bool = False
 
 class MultiSpotCycler(QObject):
     """
@@ -70,6 +63,10 @@ class MultiSpotCycler(QObject):
         self._acc90: list[float] = []
         self._acc135: list[float] = []
         self._chunk_idx: dict[int, int] = {}
+
+        # raw pixel accumulators (separate from means so mid-dwell chunk flush doesn't clear them)
+        self._raw_crops: list[np.ndarray] = []
+        self._raw_t: list[float] = []
 
         # saved state
         self._saved_roi: Optional[tuple[int,int,int,int]] = None
@@ -117,6 +114,8 @@ class MultiSpotCycler(QObject):
 
     # ---------- internals ----------
     def _setup_dirs(self) -> None:
+        if not self.cfg.save_enabled and not self.cfg.save_raw:
+            return
         os.makedirs(self.cfg.out_dir, exist_ok=True)
         for i in range(1, len(self.spots)+1):
             os.makedirs(self._spot_dir(i), exist_ok=True)
@@ -232,18 +231,23 @@ class MultiSpotCycler(QObject):
             applied = self._applied_roi
             crop_abs = None
             self._reset_acc()
-            self.progress.emit(f"Spot {i+1}/{len(self.spots)} dwell {dwell_idx+1}: ROI={applied} r≈{r:.2f}")
+            self._raw_crops.clear()
+            self._raw_t.clear()
+            self.progress.emit(f"Spot {i+1}/{len(self.spots)} dwell {dwell_idx+1}: ROI={applied} r\u2248{r:.2f}")
 
             while (time.perf_counter() - dwell_t0) < max(0.05, float(self.cfg.dwell_sec)) and not self._want_stop:
                 # _on_frame runs in emitter thread; we just yield
                 time.sleep(0.001)
                 if crop_abs is None:
                     crop_abs = getattr(self, "_last_crop_abs", None)
-                if len(self._acc_t) >= self.cfg.chunk_len:
+                if self.cfg.save_enabled and len(self._acc_t) >= self.cfg.chunk_len:
                     self._flush_chunk(i, dwell_idx, s, applied, crop_abs)
 
-            if len(self._acc_t):
+            if self.cfg.save_enabled and len(self._acc_t):
                 self._flush_chunk(i, dwell_idx, s, applied, crop_abs)
+
+            if self.cfg.save_raw and len(self._raw_crops):
+                self._flush_raw_dwell(i, dwell_idx, s, applied, crop_abs)
 
             spot_idx += 1
             if spot_idx % len(self.spots) == 0:
@@ -286,19 +290,31 @@ class MultiSpotCycler(QObject):
             crop_abs = (ax + ix, ay + iy, int(jx - ix), int(jy - iy))
             self._last_crop_abs = crop_abs
 
-            row0 = (crop_abs[1]) & 1
-            col0 = (crop_abs[0]) & 1
-            s90  = crop[row0::2,          col0::2]
-            s45  = crop[row0::2,          (col0 ^ 1)::2]
-            s135 = crop[(row0 ^ 1)::2,    col0::2]
-            s0   = crop[(row0 ^ 1)::2,    (col0 ^ 1)::2]
+            # Circular mask — only use pixels within spot radius
+            ch, cw = crop.shape
+            ccx = rcx - ix  # crop-local center
+            ccy = rcy - iy
+            yy, xx = np.ogrid[:ch, :cw]
+            circle = ((xx - ccx)**2 + (yy - ccy)**2) <= r_eff**2
 
-            def m(x: np.ndarray) -> float: return float(x.mean()) if x.size else 0.0
+            sy0 = ay + iy
+            sx0 = ax + ix
+            row_mod = ((np.arange(ch) + sy0) % 2)[:, None]
+            col_mod = ((np.arange(cw) + sx0) % 2)[None, :]
+
+            def msk(rm, cm):
+                m = circle & (row_mod == rm) & (col_mod == cm)
+                vals = crop[m]
+                return float(vals.mean()) if vals.size else 0.0
 
             t = time.perf_counter()
             self._acc_t.append(t)
-            self._acc0.append(m(s0)); self._acc45.append(m(s45))
-            self._acc90.append(m(s90)); self._acc135.append(m(s135))
+            self._acc0.append(msk(1, 1));   self._acc45.append(msk(0, 1))
+            self._acc90.append(msk(0, 0));  self._acc135.append(msk(1, 0))
+
+            if self.cfg.save_raw:
+                self._raw_crops.append(crop.copy())
+                self._raw_t.append(t)
         except Exception:
             return
 
@@ -345,6 +361,60 @@ class MultiSpotCycler(QObject):
         self.progress.emit(f"Saved {fname}  ({len(t_rel)} samples)")
         self._reset_acc()
 
+    def _flush_raw_dwell(self, spot_i: int, dwell_i: int, spot,
+                         applied_roi: Tuple[int, int, int, int] | None,
+                         crop_abs: Tuple[int, int, int, int] | None) -> None:
+        if not self._raw_crops:
+            return
+        # All crops should be same shape; discard any mismatches (e.g. during ROI transition)
+        target_shape = self._raw_crops[-1].shape
+        valid_idx = [i for i, c in enumerate(self._raw_crops) if c.shape == target_shape]
+        if not valid_idx:
+            self._raw_crops.clear()
+            self._raw_t.clear()
+            return
+
+        stack = np.stack([self._raw_crops[i] for i in valid_idx])
+        t_arr = np.array([self._raw_t[i] for i in valid_idx], dtype=np.float64)
+        t0 = float(t_arr[0])
+
+        meta: dict = {
+            "spot": {"cx": spot.cx, "cy": spot.cy, "r": spot.r,
+                     "label": getattr(spot, 'label', '')},
+            "applied_roi": {"x": int(applied_roi[0]), "y": int(applied_roi[1]),
+                            "w": int(applied_roi[2]), "h": int(applied_roi[3])} if applied_roi else None,
+            "crop_abs": {"x": int(crop_abs[0]), "y": int(crop_abs[1]),
+                         "w": int(crop_abs[2]), "h": int(crop_abs[3])} if crop_abs else None,
+            "t0_perf_counter": t0,
+            "n_frames": len(valid_idx),
+            "n_discarded": len(self._raw_crops) - len(valid_idx),
+        }
+        meta["layout"] = MOSAIC_LAYOUT_STR
+        if crop_abs:
+            tl_sy, tl_sx = crop_abs[1], crop_abs[0]
+            meta["crop_top_left_sensor_yx"] = [tl_sy, tl_sx]
+            meta["crop_top_left_channel"] = MOSAIC_LAYOUT.get((tl_sy % 2, tl_sx % 2), "?")
+
+        sd = self._spot_dir(spot_i + 1)
+        base = f"{self.cfg.base_name}_s{spot_i+1:02d}_d{dwell_i+1:04d}_raw"
+        fname = os.path.join(sd, base + ".npz")
+        jmeta = json.dumps(meta)
+        np.savez(fname, frames=stack, t=t_arr - t0,
+                 meta=np.frombuffer(jmeta.encode("utf-8"), dtype=np.uint8))
+
+        # Write companion JSON so pixel‑channel layout is easily readable
+        json_path = os.path.join(sd, base + ".json")
+        try:
+            with open(json_path, "w") as jf:
+                json.dump(meta, jf, indent=2)
+        except Exception:
+            pass
+
+        self.progress.emit(
+            f"Raw saved {fname}  ({stack.shape[0]} frames, {stack.shape[1]}\u00d7{stack.shape[2]})")
+        self._raw_crops.clear()
+        self._raw_t.clear()
+
     def _hw_roi_request_for_spot(self, cx: float, cy: float, r: float) -> Tuple[int, int, int, int]:
         """
         Aggressive ROI:
@@ -353,19 +423,19 @@ class MultiSpotCycler(QObject):
           - Offsets snapped (x step 4, y step 2) and clamped to sensor box.
         """
         h_want = max(MIN_H, int(math.ceil(2.0 * max(0.0, float(r)))))
-        h = _snap_down(h_want + (STEP_H - 1), STEP_H)
+        h = snap_down(h_want + (STEP_H - 1), STEP_H)
         h = max(MIN_H, min(MAX_H, h))
 
-        w = max(MIN_W, min(MAX_W, _snap_down(MIN_W + (STEP_W - 1), STEP_W)))
+        w = max(MIN_W, min(MAX_W, snap_down(MIN_W + (STEP_W - 1), STEP_W)))
 
         x = int(round(cx - w / 2.0))
         y = int(round(cy - h / 2.0))
-        x = _snap_down(max(OFFX_MIN, min(OFFX_MAX, x)), OFFX_STEP)
-        y = _snap_down(max(OFFY_MIN, min(OFFY_MAX, y)), OFFY_STEP)
+        x = snap_down(max(OFFX_MIN, min(OFFX_MAX, x)), OFFX_STEP)
+        y = snap_down(max(OFFY_MIN, min(OFFY_MAX, y)), OFFY_STEP)
 
         if x + w > SENSOR_W:
-            x = _snap_down(SENSOR_W - w, OFFX_STEP); x = max(OFFX_MIN, min(OFFX_MAX, x))
+            x = snap_down(SENSOR_W - w, OFFX_STEP); x = max(OFFX_MIN, min(OFFX_MAX, x))
         if y + h > SENSOR_H:
-            y = _snap_down(SENSOR_H - h, OFFY_STEP); y = max(OFFY_MIN, min(OFFY_MAX, y))
+            y = snap_down(SENSOR_H - h, OFFY_STEP); y = max(OFFY_MIN, min(OFFY_MAX, y))
 
         return (w, h, x, y)

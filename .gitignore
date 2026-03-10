@@ -3,9 +3,9 @@ __pycache__/
 .venv/
 recordings/
 recordings_processed/
+captures/
+captures_processed/
+cycles/
 
-#temp
-detect_spinners.py
+#temp for testing
 gradient_rods.avi
-gradient_rods4_nogain.avi
-pol_reconstruction.py

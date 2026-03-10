@@ -90,7 +90,7 @@ Full sensor (2464 × 2056)
 
 | Step | What happens | Who does it |
 |------|-------------|-------------|
-| **HW ROI** | Camera reads out only a rectangle around the spot. `roi_for_spot(margin=0)` uses an aggressive 256×≈2r strip; `roi_for_spot(margin=6, min_r=4)` (viewer) is more generous. | Camera hardware |
+| **HW ROI** | Camera reads out only a rectangle around the spot. **Cycler & recorder** use `roi_for_spot(cx, cy, r)` (defaults: `margin=0, min_r=0`) → aggressive 256 px wide × ≈2r tall strip for max FPS. **Viewer** uses `roi_for_spot(…, margin=6, min_r=4)` → comfortable square ≈ 2·max(4,r)+12 on each side for a nicer preview. | Camera hardware |
 | **Software crop** | A smaller even-sided square is cut from the delivered frame, tightly fitting the spot diameter + a few pixels of padding. | Recorder / cycler `_on_frame` |
 | **Circular mask** | Inside the software crop, pixels outside the circle of radius `r` are either **zeroed** (recorder) or **excluded** from means (cycler / viewer scatter). | Recorder / cycler / viewer |
 

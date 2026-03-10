@@ -77,7 +77,48 @@ python -m polarcam.cli
 
 ---
 
-## 3) Data formats
+## 3) Spot processing pipeline
+
+A spot is defined by `(cx, cy, r)` in full-sensor coordinates.  Three layers of cropping/masking happen:
+
+```
+Full sensor (2464 × 2056)
+ └─ Hardware ROI (w, h, x, y) — set on camera, reduces bus bandwidth
+     └─ Software crop (even-sided square ≈ 2r + padding, centred on spot)
+         └─ Circular mask (radius r, centred on spot)
+```
+
+| Step | What happens | Who does it |
+|------|-------------|-------------|
+| **HW ROI** | Camera reads out only a rectangle around the spot. `roi_for_spot(margin=0)` uses an aggressive 256×≈2r strip; `roi_for_spot(margin=6, min_r=4)` (viewer) is more generous. | Camera hardware |
+| **Software crop** | A smaller even-sided square is cut from the delivered frame, tightly fitting the spot diameter + a few pixels of padding. | Recorder / cycler `_on_frame` |
+| **Circular mask** | Inside the software crop, pixels outside the circle of radius `r` are either **zeroed** (recorder) or **excluded** from means (cycler / viewer scatter). | Recorder / cycler / viewer |
+
+### What each mode saves & computes
+
+| | **Signal computation** | **Saved to disk** | **Masking in saved data** |
+|---|---|---|---|
+| **Spot viewer** (scatter) | 4-channel means from **masked** (circular) pixels only | *(delegates to recorder below)* | — |
+| **Spot recorder** (`.npy` shards) | None (saves raw) | Rectangular crop `(N, h, w)` uint16 | **Zeroed** outside circle |
+| **Cycler** (channel means `.npz`) | 4-channel means from **masked** (circular) pixels only | Float64 mean arrays per channel | N/A (already reduced) |
+| **Cycler raw** (`_raw.npz`) | *(same as above)* | Rectangular crop `(N, h, w)` uint16 | **Not masked** — full rectangle preserved |
+
+The cycler keeps raw pixels unmasked intentionally: it's archival data that can be reprocessed with a different radius. The recorder zeros outside the circle because those shards are typically consumed directly and the zeros compress well.
+
+### Reference pixel: `crop_top_left_sensor_yx`
+
+The saved metadata field `crop_top_left_sensor_yx = [y, x]` is the **absolute sensor coordinate of the top-left corner of the rectangular crop** — i.e. pixel `[0, 0]` of the saved array. It is the rectangle corner, *not* the first non-zero/masked pixel.
+
+To recover the mosaic channel of any pixel `[row, col]` in a saved crop:
+
+```python
+tl_y, tl_x = meta["crop_top_left_sensor_yx"]
+channel = MOSAIC_LAYOUT[((tl_y + row) % 2, (tl_x + col) % 2)]
+```
+
+---
+
+## 4) Data formats
 
 ### Cycle `.npz` shards (channel means)
 
@@ -107,7 +148,7 @@ The `.npz` contains `frames` `(N, h, w)` uint16 stack, `t` (relative timestamps)
 
 ---
 
-## 4) Offline helpers
+## 5) Offline helpers
 
 ### `offline/merge_recording.py`
 
@@ -119,7 +160,7 @@ Merges spot‑viewer `.npy` shards for a given capture into a single contiguous 
 
 ---
 
-## 5) Polarization mosaic layout
+## 6) Polarization mosaic layout
 
 The sensor uses a 2×2 super‑pixel layout indexed by `(row % 2, col % 2)`:
 
@@ -134,7 +175,7 @@ All saved metadata references (`crop_top_left_channel`, `layout` dicts) follow t
 
 ---
 
-## 6) Project structure
+## 7) Project structure
 
 ```
 src/polarcam/
@@ -165,7 +206,7 @@ src/polarcam/
 
 ---
 
-## 7) Known gotchas
+## 8) Known gotchas
 
 * **ROI snapping**: hardware enforces step/min/max; snapping to a spot can over/under cut it.
 * **Dwell/save settings are snapshot**: toggling checkboxes mid‑cycle has no effect; values are read when you click Start Cycle.
@@ -173,7 +214,7 @@ src/polarcam/
 
 ---
 
-## 8) Notes
+## 9) Notes
 
 * Alias guard: fps/4.
 * Hardware: Sensor 2464×2056, ROI width step 4, height step 2, min width 256, min height 2.

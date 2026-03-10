@@ -4,10 +4,12 @@ Spot detection on the S-map for PolarCam.
 Uses a Difference-of-Gaussians (DoG) blob enhancer followed by thresholding
 and connected-component labelling to locate candidate spinning-fluorophore
 spots.
+
+The S-map lives on the (H−1)×(W−1) intersection grid produced by Q/U
+reconstruction.  Returned coordinates are in S-map pixel space; callers
+should add 0.5 to map to the raw mosaic frame.
 """
 from __future__ import annotations
-
-from typing import Optional
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, label
@@ -15,117 +17,84 @@ from scipy.ndimage import gaussian_filter, label
 
 def find_spot_centers_dog(
     s_map: np.ndarray,
-    sigma_small: float = 1.5,
-    sigma_large: float = 3.0,
-    k_std: float = 3.0,
-    min_area: int = 5,
-    max_area: Optional[int] = None,
-    connectivity: int = 2,
-) -> list[tuple[float, float]]:
+    *,
+    sigma1: float = 1.0,
+    sigma2: float = 6.0,
+    k_std: float = 6.0,
+    min_area: int = 10,
+    max_area: int = 250,
+    border: int = 10,
+) -> list[tuple[float, float, float]]:
     """
     Detect bright spots on an S-map using Difference-of-Gaussians filtering.
 
-    The DoG response enhances compact bright blobs while suppressing slow
-    background gradients.  Pixels above ``mean + k_std * std`` of the DoG
-    image are thresholded, and connected regions are labelled.  The centroid
-    of each region that passes the area filter is returned.
+    1. Strip *border* pixels from each edge.
+    2. DoG = Gaussian(S, σ1) − Gaussian(S, σ2).
+    3. mask = DoG > mean(DoG) + k_std × std(DoG).
+    4. 8-connected components, area filter [min_area, max_area].
+    5. Centroid + effective radius for each blob.
 
     Parameters
     ----------
     s_map : np.ndarray
-        2-D float array (H, W) — e.g. from ``SMapAccumulator.compute()``.
-    sigma_small : float
-        Inner Gaussian sigma (fine scale).
-    sigma_large : float
-        Outer Gaussian sigma (coarse scale).  Must be > sigma_small.
+        2-D float array from ``SMapAccumulator.compute()``.
+    sigma1 : float
+        Inner Gaussian σ  (sharpens spot cores).
+    sigma2 : float
+        Outer Gaussian σ  (suppresses large-scale background).
     k_std : float
-        Threshold = mean(DoG) + k_std * std(DoG).  Higher values → fewer,
-        more confident detections.
+        Threshold multiplier on the DoG standard deviation.
     min_area : int
-        Minimum connected-region size in pixels.
-    max_area : int or None
-        Maximum connected-region size in pixels.  None disables the upper
-        limit.
-    connectivity : int
-        1 → 4-connected,  2 → 8-connected (default).
+        Minimum connected-region area (pixels).
+    max_area : int
+        Maximum connected-region area (pixels).
+    border : int
+        Pixels to strip from each edge before detection.
 
     Returns
     -------
-    centers : list of (cx, cy)
-        Sub-pixel centroid coordinates (x = column, y = row) for each
-        detected spot, sorted by descending mean DoG response.
+    centers : list of (cx, cy, r_eff)
+        Centroid coordinates in **original (pre-strip) S-map space** and the
+        effective radius ``r_eff = sqrt(area / π)``.
     """
     if s_map.ndim != 2:
         raise ValueError(f"Expected 2-D s_map, got shape {s_map.shape}")
-    if sigma_large <= sigma_small:
-        raise ValueError(
-            f"sigma_large ({sigma_large}) must be greater than sigma_small ({sigma_small})"
-        )
 
-    finite_mask = np.isfinite(s_map)
-    if not finite_mask.any():
+    H, W = s_map.shape
+    inner = s_map[border:H - border, border:W - border] if border > 0 else s_map
+
+    if inner.size == 0:
         return []
 
     # --- Difference-of-Gaussians blob enhancement ---
-    s32 = s_map.astype(np.float32, copy=False)
-    dog = gaussian_filter(s32, sigma=sigma_small) - gaussian_filter(s32, sigma=sigma_large)
+    g1 = gaussian_filter(inner.astype(np.float32), sigma=sigma1)
+    g2 = gaussian_filter(inner.astype(np.float32), sigma=sigma2)
+    dog = g1 - g2
 
-    # Threshold on the DoG image
-    dog_vals = dog[finite_mask]
-    mu = float(dog_vals.mean())
-    sigma = float(dog_vals.std())
+    sigma = float(dog.std())
     if sigma == 0.0:
         return []
 
-    thr = mu + k_std * sigma
-    binary = (dog >= thr) & finite_mask
+    thr = float(dog.mean()) + k_std * sigma
+    binary = dog > thr
     if not binary.any():
         return []
 
-    # --- Connected-component labelling ---
-    struct = _connectivity_struct(connectivity)
+    # --- Connected-component labelling (8-connectivity) ---
+    struct = np.ones((3, 3), dtype=np.int32)
     labelled, n_labels = label(binary, structure=struct)
     if n_labels == 0:
         return []
 
-    # Compute centroid + mean dog response per label in one pass
-    ys, xs = np.nonzero(binary)
-    labs = labelled[ys, xs]
-
-    counts   = np.bincount(labs, minlength=n_labels + 1)
-    sum_x    = np.bincount(labs, weights=xs.astype(np.float64), minlength=n_labels + 1)
-    sum_y    = np.bincount(labs, weights=ys.astype(np.float64), minlength=n_labels + 1)
-    sum_resp = np.bincount(
-        labs, weights=dog[ys, xs].astype(np.float64), minlength=n_labels + 1
-    )
-
-    max_area_i = int(max_area) if max_area is not None else None
-
-    results: list[tuple[float, float, float]] = []  # (cx, cy, mean_response)
+    centers: list[tuple[float, float, float]] = []
     for lbl in range(1, n_labels + 1):
-        cnt = int(counts[lbl])
-        if cnt < min_area:
+        ys, xs = np.where(labelled == lbl)
+        area = len(ys)
+        if area < min_area or area > max_area:
             continue
-        if max_area_i is not None and cnt > max_area_i:
-            continue
-        cx = float(sum_x[lbl] / cnt)
-        cy = float(sum_y[lbl] / cnt)
-        mean_resp = float(sum_resp[lbl] / cnt)
-        results.append((cx, cy, mean_resp))
+        cx = float(xs.mean()) + border
+        cy = float(ys.mean()) + border
+        r_eff = float(np.sqrt(area / np.pi))
+        centers.append((cx, cy, r_eff))
 
-    # Sort strongest response first
-    results.sort(key=lambda t: t[2], reverse=True)
-    return [(cx, cy) for cx, cy, _ in results]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _connectivity_struct(connectivity: int) -> np.ndarray:
-    """Return a binary structuring element for scipy.ndimage.label."""
-    if connectivity == 1:
-        return np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.int32)
-    if connectivity == 2:
-        return np.ones((3, 3), dtype=np.int32)
-    raise ValueError(f"connectivity must be 1 or 2, got {connectivity}")
+    return centers

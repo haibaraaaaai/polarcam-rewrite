@@ -8,7 +8,6 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot, Qt
 
 # Polar mosaic: (0,0)=90°, (0,1)=45°, (1,0)=135°, (1,1)=0°
-SpotTuple = Tuple[float, float, float, int, int]  # (cx, cy, r, area, inten)
 
 # ---- Hardware limits (your camera) ----
 SENSOR_W, SENSOR_H = 2464, 2056
@@ -52,7 +51,7 @@ class MultiSpotCycler(QObject):
     _req_refresh_roi    = Signal()
     _req_refresh_timing = Signal()
 
-    def __init__(self, dev, spots: List[SpotTuple], cfg: CycleConfig) -> None:
+    def __init__(self, dev, spots, cfg: CycleConfig) -> None:
         super().__init__()
         self.dev = dev              # Controller or camera-like
         self.cam = getattr(dev, "cam", None) or dev   # whichever actually emits signals
@@ -205,7 +204,8 @@ class MultiSpotCycler(QObject):
                 break
 
             i = spot_idx % len(self.spots)
-            cx, cy, r, area, inten = self.spots[i]
+            s = self.spots[i]
+            cx, cy, r = s.cx, s.cy, s.r
 
             # Apply tiny HW ROI (queued to controller/camera thread)
             w, h, x, y = self._hw_roi_request_for_spot(cx, cy, r)
@@ -240,10 +240,10 @@ class MultiSpotCycler(QObject):
                 if crop_abs is None:
                     crop_abs = getattr(self, "_last_crop_abs", None)
                 if len(self._acc_t) >= self.cfg.chunk_len:
-                    self._flush_chunk(i, dwell_idx, (cx, cy, r, area, inten), applied, crop_abs)
+                    self._flush_chunk(i, dwell_idx, s, applied, crop_abs)
 
             if len(self._acc_t):
-                self._flush_chunk(i, dwell_idx, (cx, cy, r, area, inten), applied, crop_abs)
+                self._flush_chunk(i, dwell_idx, s, applied, crop_abs)
 
             spot_idx += 1
             if spot_idx % len(self.spots) == 0:
@@ -263,8 +263,9 @@ class MultiSpotCycler(QObject):
 
             vcx = ax + aw * 0.5
             vcy = ay + ah * 0.5
-            idx = int(np.argmin([(s[0]-vcx)**2 + (s[1]-vcy)**2 for s in self.spots]))
-            cx, cy, r, _area, _inten = self.spots[idx]
+            idx = int(np.argmin([(s.cx-vcx)**2 + (s.cy-vcy)**2 for s in self.spots]))
+            s = self.spots[idx]
+            cx, cy, r = s.cx, s.cy, s.r
 
             rcx = float(cx) - float(ax)
             rcy = float(cy) - float(ay)
@@ -306,7 +307,7 @@ class MultiSpotCycler(QObject):
         self._acc_t.clear()
         self._acc0.clear(); self._acc45.clear(); self._acc90.clear(); self._acc135.clear()
 
-    def _flush_chunk(self, spot_i: int, dwell_i: int, spot: SpotTuple,
+    def _flush_chunk(self, spot_i: int, dwell_i: int, spot,
                      applied_roi: Tuple[int, int, int, int] | None,
                      crop_abs: Tuple[int, int, int, int] | None) -> None:
         if not self._acc_t: return
@@ -318,7 +319,10 @@ class MultiSpotCycler(QObject):
         c135  = np.asarray(self._acc135, dtype=np.float64)
 
         meta = {
-            "spot": {"cx": spot[0], "cy": spot[1], "r": spot[2], "area": int(spot[3]), "inten": int(spot[4])},
+            "spot": {"cx": spot.cx, "cy": spot.cy, "r": spot.r,
+                     "label": getattr(spot, 'label', ''),
+                     "phi_cov": getattr(spot, 'phi_cov', 0.0),
+                     "std_median_r": getattr(spot, 'std_median_r', float('nan'))},
             "applied_roi": {"x": int(applied_roi[0]), "y": int(applied_roi[1]),
                             "w": int(applied_roi[2]), "h": int(applied_roi[3])} if applied_roi else None,
             "crop_abs": {"x": int(crop_abs[0]), "y": int(crop_abs[1]),

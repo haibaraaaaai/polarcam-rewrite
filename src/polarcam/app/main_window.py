@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, Signal, QThread, Slot
 from PySide6.QtGui import QImage, QPixmap, QIntValidator, QDoubleValidator, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QLabel,
     QFormLayout,
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from polarcam.app.lut_widget import HighlightLUTWidget
-from polarcam.app.spot_detect import detect_spots_smap
+from polarcam.app.spot_detect import detect_and_classify, DetectedSpot
 from polarcam.app.spot_viewer import SpotViewerDialog
 from polarcam.analysis import SMapAccumulator
 from polarcam.capture.frame_writer import FrameWriter
@@ -39,9 +40,6 @@ from polarcam.app.spot_cycler import MultiSpotCycler, CycleConfig
 # ---- TEST ONLY — remove this import and the Test (AVI) button to clean up ----
 from polarcam.backend.mock_backend import AviMockCamera
 # ---- END TEST ------------------------------------------------------------------
-
-# Old/desired spot tuple: (cx, cy, r, area, inten)
-Spot = Tuple[float, float, float, int, int]
 
 
 class MainWindow(QMainWindow):
@@ -68,13 +66,15 @@ class MainWindow(QMainWindow):
         self._on_tone_params(*self.tone.params())
 
         # detection / overlay state
-        self._spots: List[Spot] = []
+        self._all_spots: List[DetectedSpot] = []   # full detection results
+        self._spots: List[DetectedSpot] = []        # currently visible (filtered+sorted)
         self._collecting = False
         self._smap_acc: Optional[SMapAccumulator] = None
         self._smap_n_collected: int = 0
         self._detect_params: dict = {}
         self._detect_conn_active = False
         self._video_paused = False
+        self._frame_buf: List[np.ndarray] = []      # raw frames for classifier
 
         # ---- TEST ONLY ----
         self._mock_cam: Optional[AviMockCamera] = None
@@ -295,16 +295,18 @@ class MainWindow(QMainWindow):
         self._form.addRow(box)
 
     def _build_detect_ui(self) -> None:
-        box = QGroupBox("Detect spots (S-map)")
+        box = QGroupBox("Detect spots (S-map + classifier)")
         f = QFormLayout(box)
 
-        self.ed_smap_n      = QLineEdit("50")
-        self.ed_smap_sig_s  = QLineEdit("1.5")
-        self.ed_smap_sig_l  = QLineEdit("3.0")
-        self.ed_smap_kstd   = QLineEdit("3.0")
+        # S-map / detection parameters
+        self.ed_smap_n      = QLineEdit("80")
         self.ed_smap_smooth = QLineEdit("5")
-        self.ed_minA        = QLineEdit("5")
-        self.ed_maxA        = QLineEdit("500")
+        self.ed_smap_sig_s  = QLineEdit("1.0")
+        self.ed_smap_sig_l  = QLineEdit("6.0")
+        self.ed_smap_kstd   = QLineEdit("6.0")
+        self.ed_minA        = QLineEdit("10")
+        self.ed_maxA        = QLineEdit("250")
+        self.ed_border      = QLineEdit("10")
 
         intv = QIntValidator(1, 10_000, self)
         dblv = QDoubleValidator(0.1, 100.0, 2, self)
@@ -315,17 +317,36 @@ class MainWindow(QMainWindow):
             ed.setValidator(dblv)
         self.ed_minA.setValidator(intv)
         self.ed_maxA.setValidator(intv)
+        self.ed_border.setValidator(QIntValidator(0, 500, self))
+
+        f.addRow("Frames (N)",            self.ed_smap_n)
+        f.addRow("Smooth k",              self.ed_smap_smooth)
+        f.addRow("\u03c3\u2081 (inner)",   self.ed_smap_sig_s)
+        f.addRow("\u03c3\u2082 (outer)",   self.ed_smap_sig_l)
+        f.addRow("k\u00b7\u03c3 threshold", self.ed_smap_kstd)
+        f.addRow("Min area (px\u00b2)",    self.ed_minA)
+        f.addRow("Max area (px\u00b2)",    self.ed_maxA)
+        f.addRow("Border (px)",            self.ed_border)
+
+        # Classifier parameters
+        self.ed_n_phi_bins   = QLineEdit("9")
+        self.ed_min_pts_bin  = QLineEdit("2")
+        self.ed_cov_thr      = QLineEdit("0.75")
+        self.ed_r_uni_thr    = QLineEdit("0.05")
+        self.ed_n_phi_bins.setValidator(QIntValidator(2, 180, self))
+        self.ed_min_pts_bin.setValidator(QIntValidator(1, 1000, self))
+        cov_v = QDoubleValidator(0.0, 1.0, 3, self); cov_v.setNotation(QDoubleValidator.StandardNotation)
+        uni_v = QDoubleValidator(0.0, 10.0, 4, self); uni_v.setNotation(QDoubleValidator.StandardNotation)
+        self.ed_cov_thr.setValidator(cov_v)
+        self.ed_r_uni_thr.setValidator(uni_v)
+
+        f.addRow("φ-bins",                self.ed_n_phi_bins)
+        f.addRow("Min pts/bin",            self.ed_min_pts_bin)
+        f.addRow("Coverage thr",           self.ed_cov_thr)
+        f.addRow("r-uniformity thr",       self.ed_r_uni_thr)
 
         self.btn_detect = QPushButton("Detect")
         self.btn_clear_overlays = QPushButton("Clear overlays")
-
-        f.addRow("Frames (N)",     self.ed_smap_n)
-        f.addRow("\u03c3 small",         self.ed_smap_sig_s)
-        f.addRow("\u03c3 large",         self.ed_smap_sig_l)
-        f.addRow("k\u00b7\u03c3 threshold",  self.ed_smap_kstd)
-        f.addRow("Smooth k",       self.ed_smap_smooth)
-        f.addRow("Min area (px\u00b2)", self.ed_minA)
-        f.addRow("Max area (px\u00b2)", self.ed_maxA)
         row = QHBoxLayout(); row.addWidget(self.btn_detect); row.addWidget(self.btn_clear_overlays)
         w = QWidget(); w.setLayout(row); f.addRow(w)
 
@@ -334,6 +355,11 @@ class MainWindow(QMainWindow):
     def _build_spot_list_ui(self) -> None:
         box = QGroupBox("Spots")
         v = QVBoxLayout(box)
+        self.chk_spinners_only = QCheckBox("Show spinners only")
+        self.chk_spinners_only.setChecked(False)
+        self.chk_spinners_only.stateChanged.connect(lambda _: self._refresh_spot_list())
+        v.addWidget(self.chk_spinners_only)
+
         self.spot_list = QListWidget()
         self.spot_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.btn_view_spot = QPushButton("View spot…")
@@ -462,10 +488,15 @@ class MainWindow(QMainWindow):
         if not self._spots:
             return pm
 
+        from PySide6.QtGui import QColor
+        LABEL_COLOURS = {
+            "good spinner":      QColor(Qt.green),
+            "irregular spinner": QColor(255, 200, 0),   # yellow-orange
+            "partial":           QColor(Qt.red),
+        }
+
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing, True)
-        pen = QPen(Qt.green, 2)
-        p.setPen(pen)
         font = QFont()
         font.setPointSize(9)
         p.setFont(font)
@@ -473,12 +504,15 @@ class MainWindow(QMainWindow):
         ox, oy = self._roi_offset
         for i, s in enumerate(self._spots):
             try:
-                cx, cy, r, area, inten = s
-                cx = int(round(cx - ox))
-                cy = int(round(cy - oy))
-                rr = max(1, min(40, int(round(r))))   # radius in px
+                cx = int(round(s.cx - ox))
+                cy = int(round(s.cy - oy))
+                rr = max(1, min(40, int(round(s.r))))
             except Exception:
                 continue
+
+            colour = LABEL_COLOURS.get(s.label, QColor(Qt.green))
+            pen = QPen(colour, 2)
+            p.setPen(pen)
 
             if 0 <= cx < w and 0 <= cy < h:
                 p.drawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
@@ -546,27 +580,41 @@ class MainWindow(QMainWindow):
         if self._collecting:
             return
         try: n = max(2, int(float(self.ed_smap_n.text())))
-        except Exception: n = 50
+        except Exception: n = 80
         try: sig_s = float(self.ed_smap_sig_s.text())
-        except Exception: sig_s = 1.5
+        except Exception: sig_s = 1.0
         try: sig_l = float(self.ed_smap_sig_l.text())
-        except Exception: sig_l = 3.0
+        except Exception: sig_l = 6.0
         try: k_std = float(self.ed_smap_kstd.text())
-        except Exception: k_std = 3.0
+        except Exception: k_std = 6.0
         try: smooth_k = max(1, int(float(self.ed_smap_smooth.text())))
         except Exception: smooth_k = 5
         try: minA = max(1, int(float(self.ed_minA.text())))
-        except Exception: minA = 5
+        except Exception: minA = 10
         try: maxA = int(float(self.ed_maxA.text()))
-        except Exception: maxA = 500
+        except Exception: maxA = 250
+        try: border = max(0, int(float(self.ed_border.text())))
+        except Exception: border = 10
+        # Classifier params
+        try: n_phi_bins = max(2, int(float(self.ed_n_phi_bins.text())))
+        except Exception: n_phi_bins = 9
+        try: min_pts_bin = max(1, int(float(self.ed_min_pts_bin.text())))
+        except Exception: min_pts_bin = 2
+        try: cov_thr = float(self.ed_cov_thr.text())
+        except Exception: cov_thr = 0.75
+        try: r_uni_thr = float(self.ed_r_uni_thr.text())
+        except Exception: r_uni_thr = 0.05
 
         self._detect_params = {
-            "n": n, "sigma_small": sig_s, "sigma_large": sig_l,
+            "n": n, "sigma1": sig_s, "sigma2": sig_l,
             "k_std": k_std, "smooth_k": smooth_k,
-            "min_area": minA, "max_area": maxA,
+            "min_area": minA, "max_area": maxA, "border": border,
+            "n_phi_bins": n_phi_bins, "min_pts_per_bin": min_pts_bin,
+            "coverage_threshold": cov_thr, "r_uniformity_threshold": r_uni_thr,
         }
         self._smap_acc = None
         self._smap_n_collected = 0
+        self._frame_buf = []
         self._collecting = True
         self.btn_detect.setEnabled(False)
         self.status.showMessage(f"Detect: accumulating {n} frames…", 0)
@@ -587,17 +635,22 @@ class MainWindow(QMainWindow):
             if img.ndim != 2:
                 return
 
+            # Trim to even dims for mosaic consistency
+            H, W = img.shape
+            H2, W2 = (H // 2) * 2, (W // 2) * 2
+            if H2 != H or W2 != W:
+                img = img[:H2, :W2]
+
             # Lazily create the accumulator from the first frame's actual shape.
             if self._smap_acc is None:
-                H, W = img.shape
-                H2, W2 = (H // 2) * 2, (W // 2) * 2
                 self._smap_acc = SMapAccumulator(
-                    (H2, W2), smooth_k=self._detect_params.get("smooth_k", 5)
+                    img.shape, smooth_k=self._detect_params.get("smooth_k", 5)
                 )
 
             self._smap_acc.update(img)
+            self._frame_buf.append(img.copy())
             self._smap_n_collected += 1
-            n_target = self._detect_params.get("n", 50)
+            n_target = self._detect_params.get("n", 80)
 
             if self._smap_n_collected < n_target:
                 self.status.showMessage(
@@ -605,7 +658,7 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-            # Enough frames accumulated — disconnect and run detection.
+            # Enough frames accumulated — disconnect and run detection + classification.
             try:
                 self.ctrl.cam.frame.disconnect(self._collect_for_detect_smap)
             except Exception:
@@ -618,15 +671,23 @@ class MainWindow(QMainWindow):
                 return
 
             p = self._detect_params
-            spots = detect_spots_smap(
+            frame_shape = self._frame_buf[0].shape
+            spots = detect_and_classify(
                 s_map,
-                sigma_small=p.get("sigma_small", 1.5),
-                sigma_large=p.get("sigma_large", 3.0),
-                k_std=p.get("k_std", 3.0),
-                min_area=p.get("min_area", 5),
-                max_area=p.get("max_area"),
-                connectivity=2,
+                self._frame_buf,
+                frame_shape,
+                sigma1=p.get("sigma1", 1.0),
+                sigma2=p.get("sigma2", 6.0),
+                k_std=p.get("k_std", 6.0),
+                min_area=p.get("min_area", 10),
+                max_area=p.get("max_area", 250),
+                border=p.get("border", 10),
+                n_phi_bins=p.get("n_phi_bins", 9),
+                min_pts_per_bin=p.get("min_pts_per_bin", 2),
+                coverage_threshold=p.get("coverage_threshold", 0.75),
+                r_uniformity_threshold=p.get("r_uniformity_threshold", 0.05),
             )
+            self._frame_buf = []  # free memory
             self.detect_done.emit(("ok", spots))
         except Exception as e:
             try:
@@ -634,35 +695,66 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._detect_conn_active = False
+            self._frame_buf = []
             self.detect_done.emit(("err", str(e)))
 
     def _handle_detect_done(self, payload: object) -> None:
         self._collecting = False
         self.btn_detect.setEnabled(True)
         if not isinstance(payload, (list, tuple)) or len(payload) < 2:
+            self._all_spots = []
             self._spots = []
             self._refresh_spot_list()
             self.status.showMessage("Detect failed: bad payload.", 3000)
             return
         kind, data = payload
         if kind == "ok":
-            spots: List[Spot] = list(data or [])
-            self._spots = spots
+            self._all_spots = list(data or [])
             self._refresh_spot_list()
-            self.status.showMessage(f"Detect: {len(self._spots)} spot(s).", 3000)
+            n_good = sum(1 for s in self._all_spots if s.label == "good spinner")
+            n_irreg = sum(1 for s in self._all_spots if s.label == "irregular spinner")
+            n_part = sum(1 for s in self._all_spots if s.label == "partial")
+            self.status.showMessage(
+                f"Detect: {len(self._all_spots)} spot(s) — "
+                f"{n_good} good, {n_irreg} irregular, {n_part} partial.", 5000
+            )
         else:
+            self._all_spots = []
             self._spots = []
             self._refresh_spot_list()
             self.status.showMessage(f"Detect failed: {data}", 4000)
 
     def _refresh_spot_list(self) -> None:
+        """Filter, sort, and display spots based on the toggle state."""
+        spinners_only = self.chk_spinners_only.isChecked()
+
+        if spinners_only:
+            # Only irregular + good spinners, sorted by std_median_r ascending (best first)
+            visible = [s for s in self._all_spots if s.label != "partial"]
+            visible.sort(key=lambda s: s.std_median_r if np.isfinite(s.std_median_r) else 1e9)
+        else:
+            # All spots: partials first (by phi_cov ascending), then spinners (by std_median_r ascending)
+            partials = [s for s in self._all_spots if s.label == "partial"]
+            spinners = [s for s in self._all_spots if s.label != "partial"]
+            partials.sort(key=lambda s: s.phi_cov)
+            spinners.sort(key=lambda s: s.std_median_r if np.isfinite(s.std_median_r) else 1e9)
+            visible = partials + spinners
+
+        self._spots = visible
         self.spot_list.clear()
+
+        LABEL_SYM = {"partial": "\u2717", "irregular spinner": "\u25ce", "good spinner": "\u2713"}
         for i, s in enumerate(self._spots):
-            cx, cy, r, area, inten = s
-            item = QListWidgetItem(f"#{i+1}  (x={cx:.1f}, y={cy:.1f})  r≈{r:.1f}px  A={area}  I={inten}")
+            sym = LABEL_SYM.get(s.label, "?")
+            smr = f"{s.std_median_r:.4f}" if np.isfinite(s.std_median_r) else "n/a"
+            item = QListWidgetItem(
+                f"#{i+1} {sym} {s.label}  (x={s.cx:.1f}, y={s.cy:.1f})  "
+                f"r\u2248{s.r:.1f}px  \u03c6={s.phi_cov:.2f}  \u03c3r={smr}"
+            )
             self.spot_list.addItem(item)
 
     def _clear_overlays(self) -> None:
+        self._all_spots = []
         self._spots = []
         self._refresh_spot_list()
         self.status.showMessage("Overlays cleared.", 1500)
@@ -788,8 +880,9 @@ class MainWindow(QMainWindow):
         idxs = self._selected_spot_indices()
         if not idxs:
             return
-        keep = [s for i, s in enumerate(self._spots) if i not in idxs]
-        self._spots = keep
+        # Remove from both the visible list and the master list
+        to_remove = {id(self._spots[i]) for i in idxs if i < len(self._spots)}
+        self._all_spots = [s for s in self._all_spots if id(s) not in to_remove]
         self._refresh_spot_list()
 
     # ---------- CYCLE: start/stop threads ----------

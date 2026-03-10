@@ -40,7 +40,7 @@ class SpotViewerWindow(QMainWindow):
     def __init__(
         self,
         dev,  # Controller or camera-like object
-        spots: List[Tuple[float, float, float, int, int]],
+        spots,  # List[DetectedSpot] or List[tuple]
         parent: Optional[QMainWindow] = None,
         index: int = 0,
         **_ignored_kwargs,
@@ -161,7 +161,8 @@ class SpotViewerWindow(QMainWindow):
         if a is None or a.ndim != 2 or not self.spots:
             return
 
-        cx, cy, r, _area, _inten = self.spots[self.idx]
+        s = self.spots[self.idx]
+        cx, cy, r = s.cx, s.cy, s.r
 
         ax, ay, aw, ah = self._applied_roi
         if aw <= 0 or ah <= 0:
@@ -212,8 +213,8 @@ class SpotViewerWindow(QMainWindow):
             self.status.showMessage("Recorder can’t find a camera with .roi/.frame; preview only.", 4000)
             return
 
-        cx, cy, r, area, inten = self.spots[self.idx]
-        spot = SpotRT(cx, cy, r, int(area), int(inten))  # runtime class
+        s = self.spots[self.idx]
+        spot = SpotRT(s.cx, s.cy, s.r, 0, 0)  # runtime class
 
         out_dir = os.path.join(os.getcwd(), "captures")
         cfg = RecorderConfigRT(

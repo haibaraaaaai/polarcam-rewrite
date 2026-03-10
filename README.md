@@ -45,8 +45,8 @@ python -m polarcam.cli
 
 **Directory conventions**
 
-* Cycle outputs land in `./cycles/cycle_spotXX/…npz` (and `…_raw.npz` + `…_raw.json` if raw pixel saving is enabled).
-* Spot viewer recordings land in `./captures/…npy` + `…_meta.json`.
+* Cycle outputs land in `./cycles/cycle_YYYYMMDD_HHMMSS/cycle_spotXX/…npz` (timestamped per run).
+* Spot viewer recordings land in `./captures/spotN_YYYYMMDD_HHMMSS/…npy` + `…_meta.json`.
 
 ---
 

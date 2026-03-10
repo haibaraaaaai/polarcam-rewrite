@@ -991,7 +991,8 @@ class MainWindow(QMainWindow):
         if not self._spots:
             QMessageBox.information(self, "Cycle", "No spots selected/detected.")
             return
-        out_dir = os.path.join(os.getcwd(), "cycles")
+        out_dir = os.path.join(os.getcwd(), "cycles",
+                              time.strftime("cycle_%Y%m%d_%H%M%S"))
         save_on = self.chk_cycle_save.isChecked()
         raw_on = self.chk_cycle_raw.isChecked()
         try:

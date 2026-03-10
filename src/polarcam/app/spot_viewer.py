@@ -402,7 +402,8 @@ class SpotViewerWindow(QMainWindow):
         s = self.spots[self.idx]
         spot = s  # already a Spot instance
 
-        out_dir = os.path.join(os.getcwd(), "captures")
+        out_dir = os.path.join(os.getcwd(), "captures",
+                              time.strftime(f"spot{self.idx+1}_%Y%m%d_%H%M%S"))
         cfg = RecorderConfigRT(
             out_dir=out_dir,
             base_name=f"spot{self.idx+1}",

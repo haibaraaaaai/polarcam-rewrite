@@ -18,7 +18,7 @@ class HighlightLUTWidget(QWidget):
     • Drag LEFT handle  → black floor (12-bit, 0..4095)
     • Drag RIGHT handle → white cap   (12-bit, 0..4095)
     • Hold CTRL + mouse wheel → adjust gamma
-    • Double-click → reset to defaults (floor=3000, cap=4095, gamma=0.6)
+    • Double-click → reset to defaults (floor=0, cap=4095, gamma=1.0)
 
     Signals
     -------
@@ -41,9 +41,9 @@ class HighlightLUTWidget(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)  # so wheel works when focused
 
         # state
-        self._floor = 3000      # 12-bit
+        self._floor = 0         # 12-bit
         self._cap   = 4095      # 12-bit
-        self._gamma = 0.6
+        self._gamma = 1.0
         self._drag: Optional[str] = None     # "black" | "white" | None
         self._hist: Optional[np.ndarray] = None  # optional 256-bin histogram
 
@@ -144,7 +144,7 @@ class HighlightLUTWidget(QWidget):
 
     def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:
         # reset to defaults
-        self._floor, self._cap, self._gamma = 3000, 4095, 0.6
+        self._floor, self._cap, self._gamma = 0, 4095, 1.0
         self.paramsChanged.emit(self._floor, self._cap, self._gamma)
         self.update()
         super().mouseDoubleClickEvent(e)

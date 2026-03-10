@@ -1,6 +1,11 @@
 __pycache__/
 *.egg-info/
 .venv/
-varmap_runs/
-cycles/
-captures/
+recordings/
+recordings_processed/
+
+#temp
+detect_spinners.py
+gradient_rods.avi
+gradient_rods4_nogain.avi
+pol_reconstruction.py

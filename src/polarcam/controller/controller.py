@@ -3,7 +3,7 @@ from __future__ import annotations
 Thin application-facing controller.
 
 - Owns the camera facade (IDSCamera) but stays UI-agnostic.
-- Provides small convenience helpers (auto-desaturate, quick varmap capture).
+- Provides small convenience helpers (auto-desaturate).
 - Avoids terminal spam: uses `logging` (configured in `polarcam.__init__`).
 """
 
@@ -108,16 +108,17 @@ class Controller(QObject):
         except Exception:
             log.exception("close() during shutdown failed")
 
-    # ---------- varmap capture -------------------------------------------
-    def varmap_capture_and_compute(
+    # (varmap capture removed — replaced by SMapAccumulator in analysis/smap.py)
+
+    def _varmap_capture_and_compute_REMOVED(  # type: ignore[return]
         self,
         n_frames: int,
         mode: str = "intensity_range",
-        use_memmap: Optional[bool] = None,   # legacy alias
+        use_memmap: Optional[bool] = None,
         memmap: Optional[bool] = None,
         on_progress: Optional[Callable[[float, str], None]] = None,
         cancel_flag: Optional[Callable[[], bool]] = None,
-        **_ignore,  # absorbs unexpected kwargs (e.g. dialog=...)
+        **_ignore,
     ) -> Dict[str, Any]:
         """
         Capture a short burst and compute a simple variance-like map.

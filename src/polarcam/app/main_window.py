@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, Signal, QThread, Slot
 from PySide6.QtGui import QImage, QPixmap, QIntValidator, QDoubleValidator, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QLabel,
     QFormLayout,
     QHBoxLayout,
@@ -27,11 +28,17 @@ from PySide6.QtWidgets import (
 )
 
 from polarcam.app.lut_widget import HighlightLUTWidget
-from polarcam.app.spot_detect import detect_spots_oneframe
+from polarcam.app.spot_detect import detect_spots_smap
 from polarcam.app.spot_viewer import SpotViewerDialog
+from polarcam.analysis import SMapAccumulator
+from polarcam.capture.frame_writer import FrameWriter
 
 # Cycling recorder
 from polarcam.app.spot_cycler import MultiSpotCycler, CycleConfig
+
+# ---- TEST ONLY — remove this import and the Test (AVI) button to clean up ----
+from polarcam.backend.mock_backend import AviMockCamera
+# ---- END TEST ------------------------------------------------------------------
 
 # Old/desired spot tuple: (cx, cy, r, area, inten)
 Spot = Tuple[float, float, float, int, int]
@@ -63,10 +70,21 @@ class MainWindow(QMainWindow):
         # detection / overlay state
         self._spots: List[Spot] = []
         self._collecting = False
-        self._collect_frames: List[np.ndarray] = []
-        self._detect_params: Tuple = tuple()
+        self._smap_acc: Optional[SMapAccumulator] = None
+        self._smap_n_collected: int = 0
+        self._detect_params: dict = {}
         self._detect_conn_active = False
         self._video_paused = False
+
+        # ---- TEST ONLY ----
+        self._mock_cam: Optional[AviMockCamera] = None
+        # ---- END TEST -----
+
+        # frame writer state
+        self._frame_writer = FrameWriter(self)
+        self._frame_writer.progress.connect(self._on_record_progress, Qt.QueuedConnection)
+        self._frame_writer.stopped.connect(self._on_record_stopped, Qt.QueuedConnection)
+        self._frame_writer.error.connect(self._on_record_error, Qt.QueuedConnection)
 
         # preview throttle (used during Cycle mode)
         self._cycle_active = False
@@ -77,6 +95,7 @@ class MainWindow(QMainWindow):
         self._build_video()
         self._build_toolbar()
         self._build_forms()
+        self._build_record_ui()
         self._build_detect_ui()
         self._build_spot_list_ui()
         self._assemble_layout()
@@ -128,19 +147,23 @@ class MainWindow(QMainWindow):
         self.btn_desat.clicked.connect(self._desaturate_clicked)
         self.btn_apply_gains.clicked.connect(self._apply_gains)
         self.btn_refresh_gains.clicked.connect(self._refresh_gains)
-        self.btn_varmap.clicked.connect(self._open_varmap)
         self.btn_detect.clicked.connect(self._detect_clicked)
         self.btn_clear_overlays.clicked.connect(self._clear_overlays)
         self.btn_view_spot.clicked.connect(self._view_selected_spots)
         self.btn_remove_spot.clicked.connect(self._remove_selected_spots)
+        self.btn_record_start.clicked.connect(self._start_record_clicked)
+        self.btn_record_stop.clicked.connect(self._stop_record_clicked)
+        self.btn_record_browse.clicked.connect(self._browse_record_dir)
 
         # Cycle buttons
         self.btn_cycle_start.clicked.connect(self._start_cycle_clicked)
         self.btn_cycle_stop.clicked.connect(self._stop_cycle_clicked)
+        # ---- TEST ONLY ----
+        self.btn_test_avi.clicked.connect(self._load_avi_test)
+        # ---- END TEST -----
 
         self.detect_done.connect(self._handle_detect_done, Qt.QueuedConnection)
 
-        self._varmap = None
         self._last_pm: Optional[QPixmap] = None
 
         self._roi_offset = (0, 0)   # (OffsetX, OffsetY)
@@ -165,10 +188,16 @@ class MainWindow(QMainWindow):
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Stop")
         self.btn_close = QPushButton("Close")
-        self.btn_varmap = QPushButton("Variance…")
+        # ---- TEST ONLY — remove btn_test and its connect() call to clean up ----
+        self.btn_test_avi = QPushButton("Test (AVI)…")
+        self.btn_test_avi.setStyleSheet("color: darkorange; font-weight: bold;")
+        # ---- END TEST -------------------------------------------------------
         self._toolbar = QHBoxLayout()
-        for b in (self.btn_open, self.btn_start, self.btn_stop, self.btn_close, self.btn_varmap):
+        for b in (self.btn_open, self.btn_start, self.btn_stop, self.btn_close):
             self._toolbar.addWidget(b)
+        # ---- TEST ONLY ----
+        self._toolbar.addWidget(self.btn_test_avi)
+        # ---- END TEST -----
         self._toolbar.addStretch(1)
 
     def _build_forms(self) -> None:
@@ -229,23 +258,74 @@ class MainWindow(QMainWindow):
         rg = QWidget(); rg.setLayout(rowg)
         self._form.addRow(rg)
 
-    def _build_detect_ui(self) -> None:
-        box = QGroupBox("Detect spots (single frame, old logic)")
+    def _build_record_ui(self) -> None:
+        box = QGroupBox("Record frames")
         f = QFormLayout(box)
 
-        self.cmb_thr_mode = QComboBox()
-        self.cmb_thr_mode.addItems(["absolute", "percentile"])
-        self.ed_thr_val = QLineEdit("1200")
-        self.ed_minA = QLineEdit("6")
-        self.ed_maxA = QLineEdit("5000")
+        # Output directory row
+        dir_row = QHBoxLayout()
+        self.ed_record_dir = QLineEdit(os.path.join(os.getcwd(), "recordings"))
+        self.btn_record_browse = QPushButton("Browse…")
+        self.btn_record_browse.setMaximumWidth(70)
+        dir_row.addWidget(self.ed_record_dir, 1)
+        dir_row.addWidget(self.btn_record_browse)
+        dir_w = QWidget(); dir_w.setLayout(dir_row)
+        f.addRow("Output dir", dir_w)
+
+        self.ed_record_chunk = QLineEdit("50")
+        self.ed_record_chunk.setValidator(QIntValidator(1, 100_000, self))
+        f.addRow("Frames/chunk", self.ed_record_chunk)
+
+        self.ed_record_max = QLineEdit("0")
+        self.ed_record_max.setValidator(QIntValidator(0, 10_000_000, self))
+        f.addRow("Max frames (0=∞)", self.ed_record_max)
+
+        self.lbl_record_count = QLabel("0 frames")
+        f.addRow("Recorded", self.lbl_record_count)
+
+        self.btn_record_start = QPushButton("Start recording")
+        self.btn_record_stop  = QPushButton("Stop recording")
+        self.btn_record_stop.setEnabled(False)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_record_start)
+        btn_row.addWidget(self.btn_record_stop)
+        btn_w = QWidget(); btn_w.setLayout(btn_row)
+        f.addRow(btn_w)
+
+        self._form.addRow(box)
+
+    def _build_detect_ui(self) -> None:
+        box = QGroupBox("Detect spots (S-map)")
+        f = QFormLayout(box)
+
+        self.ed_smap_n      = QLineEdit("50")
+        self.ed_smap_sig_s  = QLineEdit("1.5")
+        self.ed_smap_sig_l  = QLineEdit("3.0")
+        self.ed_smap_kstd   = QLineEdit("3.0")
+        self.ed_smap_smooth = QLineEdit("5")
+        self.ed_minA        = QLineEdit("5")
+        self.ed_maxA        = QLineEdit("500")
+
+        intv = QIntValidator(1, 10_000, self)
+        dblv = QDoubleValidator(0.1, 100.0, 2, self)
+        dblv.setNotation(QDoubleValidator.StandardNotation)
+        self.ed_smap_n.setValidator(intv)
+        self.ed_smap_smooth.setValidator(QIntValidator(1, 99, self))
+        for ed in (self.ed_smap_sig_s, self.ed_smap_sig_l, self.ed_smap_kstd):
+            ed.setValidator(dblv)
+        self.ed_minA.setValidator(intv)
+        self.ed_maxA.setValidator(intv)
 
         self.btn_detect = QPushButton("Detect")
         self.btn_clear_overlays = QPushButton("Clear overlays")
 
-        f.addRow("Threshold mode", self.cmb_thr_mode)
-        f.addRow("Threshold value", self.ed_thr_val)
-        f.addRow("Min area", self.ed_minA)
-        f.addRow("Max area", self.ed_maxA)
+        f.addRow("Frames (N)",     self.ed_smap_n)
+        f.addRow("\u03c3 small",         self.ed_smap_sig_s)
+        f.addRow("\u03c3 large",         self.ed_smap_sig_l)
+        f.addRow("k\u00b7\u03c3 threshold",  self.ed_smap_kstd)
+        f.addRow("Smooth k",       self.ed_smap_smooth)
+        f.addRow("Min area (px\u00b2)", self.ed_minA)
+        f.addRow("Max area (px\u00b2)", self.ed_maxA)
         row = QHBoxLayout(); row.addWidget(self.btn_detect); row.addWidget(self.btn_clear_overlays)
         w = QWidget(); w.setLayout(row); f.addRow(w)
 
@@ -465,66 +545,95 @@ class MainWindow(QMainWindow):
     def _detect_clicked(self) -> None:
         if self._collecting:
             return
-        mode = self.cmb_thr_mode.currentText().strip().lower()
-        try: thr_val = float(self.ed_thr_val.text())
-        except Exception: thr_val = 1200.0
-        try: minA = int(float(self.ed_minA.text()))
-        except Exception: minA = 6
+        try: n = max(2, int(float(self.ed_smap_n.text())))
+        except Exception: n = 50
+        try: sig_s = float(self.ed_smap_sig_s.text())
+        except Exception: sig_s = 1.5
+        try: sig_l = float(self.ed_smap_sig_l.text())
+        except Exception: sig_l = 3.0
+        try: k_std = float(self.ed_smap_kstd.text())
+        except Exception: k_std = 3.0
+        try: smooth_k = max(1, int(float(self.ed_smap_smooth.text())))
+        except Exception: smooth_k = 5
+        try: minA = max(1, int(float(self.ed_minA.text())))
+        except Exception: minA = 5
         try: maxA = int(float(self.ed_maxA.text()))
-        except Exception: maxA = 5000
+        except Exception: maxA = 500
 
-        self._detect_params = (mode, thr_val, minA, maxA)
+        self._detect_params = {
+            "n": n, "sigma_small": sig_s, "sigma_large": sig_l,
+            "k_std": k_std, "smooth_k": smooth_k,
+            "min_area": minA, "max_area": maxA,
+        }
+        self._smap_acc = None
+        self._smap_n_collected = 0
         self._collecting = True
-        self._collect_frames = []
         self.btn_detect.setEnabled(False)
-        self.status.showMessage("Detect: grabbing one frame…", 0)
+        self.status.showMessage(f"Detect: accumulating {n} frames…", 0)
 
         if not self._detect_conn_active:
             try:
-                self.ctrl.cam.frame.connect(self._collect_for_detect_1f, Qt.QueuedConnection)
+                self.ctrl.cam.frame.connect(self._collect_for_detect_smap, Qt.QueuedConnection)
                 self._detect_conn_active = True
             except Exception:
                 self._detect_conn_active = False
                 self.detect_done.emit(("err", "Camera not available for detect."))
 
-    def _collect_for_detect_1f(self, arr_obj: object) -> None:
+    def _collect_for_detect_smap(self, arr_obj: object) -> None:
         if not self._detect_conn_active:
             return
         try:
-            self.ctrl.cam.frame.disconnect(self._collect_for_detect_1f)
-        except Exception:
-            pass
-        self._detect_conn_active = False
-
-        try:
             img = np.asarray(arr_obj)
             if img.ndim != 2:
-                raise RuntimeError("Frame is not 2D.")
-            mode, thr_val, minA, maxA = self._detect_params
+                return
 
-            spots = detect_spots_oneframe(
-                img.astype(np.uint16, copy=False),
-                thr_mode="percentile" if mode == "percentile" else "absolute",
-                thr_value=thr_val,
-                min_area=minA,
-                max_area=maxA,
-                open_radius=2,
-                close_radius=1,
-                remove_border=True,
-                debug=True,
+            # Lazily create the accumulator from the first frame's actual shape.
+            if self._smap_acc is None:
+                H, W = img.shape
+                H2, W2 = (H // 2) * 2, (W // 2) * 2
+                self._smap_acc = SMapAccumulator(
+                    (H2, W2), smooth_k=self._detect_params.get("smooth_k", 5)
+                )
+
+            self._smap_acc.update(img)
+            self._smap_n_collected += 1
+            n_target = self._detect_params.get("n", 50)
+
+            if self._smap_n_collected < n_target:
+                self.status.showMessage(
+                    f"Detect: frame {self._smap_n_collected}/{n_target}…", 0
+                )
+                return
+
+            # Enough frames accumulated — disconnect and run detection.
+            try:
+                self.ctrl.cam.frame.disconnect(self._collect_for_detect_smap)
+            except Exception:
+                pass
+            self._detect_conn_active = False
+
+            s_map = self._smap_acc.compute()
+            if s_map is None:
+                self.detect_done.emit(("err", "S-map is empty."))
+                return
+
+            p = self._detect_params
+            spots = detect_spots_smap(
+                s_map,
+                sigma_small=p.get("sigma_small", 1.5),
+                sigma_large=p.get("sigma_large", 3.0),
+                k_std=p.get("k_std", 3.0),
+                min_area=p.get("min_area", 5),
+                max_area=p.get("max_area"),
+                connectivity=2,
             )
-
-            # show overlays on the exact frame used for detection
-            self._spots = list(spots)
-            a16 = img.astype(np.uint16, copy=False)
-            a8 = self._lut[a16] if self._lut is not None else ((a16 + 8) >> 4).astype(np.uint8, copy=False)
-            if not a8.flags.c_contiguous: a8 = np.ascontiguousarray(a8)
-            pm = self._compose_pixmap_with_overlays(a8)
-            self._last_pm = pm
-            self._refresh_video_view()
-
             self.detect_done.emit(("ok", spots))
         except Exception as e:
+            try:
+                self.ctrl.cam.frame.disconnect(self._collect_for_detect_smap)
+            except Exception:
+                pass
+            self._detect_conn_active = False
             self.detect_done.emit(("err", str(e)))
 
     def _handle_detect_done(self, payload: object) -> None:
@@ -557,6 +666,79 @@ class MainWindow(QMainWindow):
         self._spots = []
         self._refresh_spot_list()
         self.status.showMessage("Overlays cleared.", 1500)
+
+    # ---------- record frames ----------
+    def _browse_record_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(
+            self, "Select recording folder",
+            self.ed_record_dir.text() or os.getcwd(),
+        )
+        if d:
+            self.ed_record_dir.setText(d)
+
+    def _start_record_clicked(self) -> None:
+        if self._frame_writer.is_running:
+            return
+        out_dir = self.ed_record_dir.text().strip() or os.path.join(os.getcwd(), "recordings")
+        try:
+            chunk = max(1, int(float(self.ed_record_chunk.text())))
+        except Exception:
+            chunk = 50
+        try:
+            max_f = max(0, int(float(self.ed_record_max.text())))
+        except Exception:
+            max_f = 0
+
+        try:
+            self.ctrl.cam.frame.connect(self._frame_writer.record, Qt.QueuedConnection)
+        except Exception as exc:
+            self.status.showMessage(f"Record: could not connect to camera — {exc}", 4000)
+            return
+
+        try:
+            current_fps = float(self.ed_fps.text())
+        except Exception:
+            current_fps = 0.0
+
+        self._frame_writer.start(
+            out_dir=out_dir,
+            base_name="frames",
+            chunk_len=chunk,
+            max_frames=max_f,
+            fps=current_fps,
+        )
+        self.lbl_record_count.setText("0 frames")
+        self.btn_record_start.setEnabled(False)
+        self.btn_record_stop.setEnabled(True)
+        self.status.showMessage(
+            f"Recording to {out_dir}  (chunk={chunk}, max={max_f or '\u221e'})", 3000
+        )
+
+    def _stop_record_clicked(self) -> None:
+        if not self._frame_writer.is_running:
+            return
+        try:
+            self.ctrl.cam.frame.disconnect(self._frame_writer.record)
+        except Exception:
+            pass
+        self._frame_writer.stop()  # triggers _on_record_stopped via signal
+
+    @Slot(int)
+    def _on_record_progress(self, n: int) -> None:
+        self.lbl_record_count.setText(f"{n} frames")
+
+    @Slot()
+    def _on_record_stopped(self) -> None:
+        total = self._frame_writer.frames_recorded
+        self.btn_record_start.setEnabled(True)
+        self.btn_record_stop.setEnabled(False)
+        self.status.showMessage(f"Recording stopped — {total} frames saved.", 4000)
+
+    @Slot(str)
+    def _on_record_error(self, msg: str) -> None:
+        self.status.showMessage(f"Record error: {msg}", 6000)
+        self.btn_record_start.setEnabled(True)
+        self.btn_record_stop.setEnabled(False)
 
     # ---------- view/remove spots ----------
     def _selected_spot_indices(self) -> List[int]:
@@ -773,15 +955,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_desat"): self.btn_desat.setEnabled(True)
         self.status.showMessage("Auto-desaturate complete.", 1500)
 
-    def _open_varmap(self) -> None:
-        if self._varmap_alive():
-            self._varmap.raise_(); self._varmap.activateWindow(); return
-        from polarcam.app.varmap_dialog import VarMapDialog
-        dlg = VarMapDialog(self.ctrl, self)
-        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
-        dlg.destroyed.connect(lambda _=None: setattr(self, "_varmap", None))
-        self._varmap = dlg; dlg.show()
-
     # ---------- LUT plumbing ----------
     def _on_tone_params(self, floor: int, cap: int, gamma: float) -> None:
         self._lut = self._build_lut(floor, cap, gamma)
@@ -795,13 +968,6 @@ class MainWindow(QMainWindow):
         t = np.clip(t, 0.0, 1.0)
         y = np.power(t, gamma) * 255.0
         return np.clip(np.rint(y), 0, 255).astype(np.uint8)
-
-    def _varmap_alive(self) -> bool:
-        vm = getattr(self, "_varmap", None)
-        if vm is None: return False
-        try: return vm.isVisible()
-        except RuntimeError:
-            self._varmap = None; return False
 
     def _refresh_video_view(self) -> None:
         pm = getattr(self, "_last_pm", None)
@@ -822,8 +988,57 @@ class MainWindow(QMainWindow):
         else:
             self._cycle_active = False
 
+    # ---- TEST ONLY — delete this entire method block to clean up ----
+    def _load_avi_test(self) -> None:
+        """Load an AVI and replace the camera feed with looping frames."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open AVI for mock camera", "", "Video files (*.avi *.mp4 *.mov);;All files (*)"
+        )
+        if not path:
+            return
+
+        # Stop and tear down any previous mock
+        if self._mock_cam is not None:
+            self._mock_cam.stop()
+            self._mock_cam.close()
+            try:
+                self._mock_cam.frame.disconnect(self._on_frame)
+            except Exception:
+                pass
+            self._mock_cam = None
+
+        mock = AviMockCamera()
+
+        # Wire mock signals → existing GUI handlers so everything behaves normally
+        mock.opened.connect(self._on_open,    Qt.QueuedConnection)
+        mock.started.connect(self._on_started, Qt.QueuedConnection)
+        mock.stopped.connect(self._on_stopped, Qt.QueuedConnection)
+        mock.closed.connect(self._on_closed,  Qt.QueuedConnection)
+        mock.error.connect(self._on_error,    Qt.QueuedConnection)
+        mock.roi.connect(self._on_roi,        Qt.QueuedConnection)
+        mock.timing.connect(self._on_timing,  Qt.QueuedConnection)
+        mock.frame.connect(self._on_frame,    Qt.QueuedConnection)
+
+        # Replace ctrl.cam so the cycler, recorder, and detect all talk to mock
+        self.ctrl.cam = mock
+        self._mock_cam = mock
+
+        try:
+            mock.open(path)
+            mock.start()
+        except Exception as exc:
+            self.status.showMessage(f"AVI mock error: {exc}", 6000)
+    # ---- END TEST -------------------------------------------------------
+
     # ---------- cleanup ----------
     def safe_shutdown(self) -> None:
+        try:
+            if self._frame_writer.is_running:
+                try: self.ctrl.cam.frame.disconnect(self._frame_writer.record)
+                except Exception: pass
+                self._frame_writer.stop()
+        except Exception:
+            pass
         try:
             # stop cycler if running
             if self._cycler:
@@ -841,6 +1056,13 @@ class MainWindow(QMainWindow):
         except Exception: pass
 
     def closeEvent(self, e) -> None:
+        try:
+            if self._frame_writer.is_running:
+                try: self.ctrl.cam.frame.disconnect(self._frame_writer.record)
+                except Exception: pass
+                self._frame_writer.stop()
+        except Exception:
+            pass
         try:
             if self._cycler:
                 try: self._cycler.stop()

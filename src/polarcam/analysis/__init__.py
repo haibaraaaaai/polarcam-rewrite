@@ -1,8 +1,13 @@
 """
 Analysis utilities for PolarCam.
-
-Exports:
-- compute_varmap: per-pixel activity/variance maps from a frame stack.
 """
-from .varmap import compute_varmap
-__all__ = ["compute_varmap"]
+from .pol_reconstruction import make_xy_reconstructor, make_qu_reconstructor
+from .smap import SMapAccumulator
+from .detect import find_spot_centers_dog
+
+__all__ = [
+    "make_xy_reconstructor",
+    "make_qu_reconstructor",
+    "SMapAccumulator",
+    "find_spot_centers_dog",
+]

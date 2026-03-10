@@ -37,7 +37,7 @@ python -m polarcam.cli
 * Live preview of the polarization camera (12→8‑bit highlight LUT with floor/cap/gamma).
 * ROI + timing controls (FPS + **exposure in ms**), desaturate helper.
 * Analog/digital gains.
-* **Spot detection** on a single frame (DoG‑based, with two‑stage φ‑coverage / r‑uniformity classification).
+* **Spot detection** on a given number of frames (DoG‑based, with two‑stage φ‑coverage / r‑uniformity classification).
 * **Spot viewer**: shows a zoomed crop with circular ROI mask, live 4‑channel anisotropy scatter plot, optional **recording at max camera FPS** (saves raw pixel `.npy` shards + JSON metadata with mosaic layout info).
 * **Manual add‑spot** with live preview circle (cyan dashed) shown before committing.
 * **Multi‑spot cycler/recorder**: hops a tight HW‑ROI around selected spots with configurable dwell time, records 4×pol mean signals per dwell to compressed `.npz` shards. Optional **raw pixel saving** (one uncompressed `.npz` + companion `.json` per spot per dwell with full mosaic layout metadata).

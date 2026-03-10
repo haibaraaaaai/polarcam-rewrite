@@ -29,10 +29,11 @@ from PySide6.QtWidgets import (
 )
 
 from polarcam.app.lut_widget import HighlightLUTWidget
-from polarcam.app.spot_detect import detect_and_classify, DetectedSpot
+from polarcam.app.spot_detect import detect_and_classify
 from polarcam.app.spot_viewer import SpotViewerDialog
 from polarcam.analysis import SMapAccumulator
 from polarcam.capture.frame_writer import FrameWriter
+from polarcam.hardware import Spot
 
 # Cycling recorder
 from polarcam.app.spot_cycler import MultiSpotCycler, CycleConfig
@@ -66,8 +67,8 @@ class MainWindow(QMainWindow):
         self._on_tone_params(*self.tone.params())
 
         # detection / overlay state
-        self._all_spots: List[DetectedSpot] = []   # full detection results
-        self._spots: List[DetectedSpot] = []        # currently visible (filtered+sorted)
+        self._all_spots: List[Spot] = []   # full detection results
+        self._spots: List[Spot] = []        # currently visible (filtered+sorted)
         self._collecting = False
         self._smap_acc: Optional[SMapAccumulator] = None
         self._smap_n_collected: int = 0
@@ -975,7 +976,7 @@ class MainWindow(QMainWindow):
         ox, oy = self._roi_offset
         cx_abs = cx_local + ox
         cy_abs = cy_local + oy
-        spot = DetectedSpot(
+        spot = Spot(
             cx=cx_abs, cy=cy_abs, r=r,
             label="manual", phi_cov=0.0, std_median_r=float('inf'),
         )

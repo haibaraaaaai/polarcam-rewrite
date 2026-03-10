@@ -11,6 +11,7 @@ from polarcam.hardware import (
     SENSOR_W, SENSOR_H, STEP_W, STEP_H, MIN_W, MIN_H, MAX_W, MAX_H,
     OFFX_MIN, OFFX_MAX, OFFY_MIN, OFFY_MAX, OFFX_STEP, OFFY_STEP,
     MOSAIC_LAYOUT, MOSAIC_LAYOUT_STR, snap_down, clamp, snap_even,
+    Spot, roi_for_spot,
 )
 
 PAD_SW   = 2      # software padding around diameter
@@ -21,13 +22,6 @@ DEFAULT_CHUNK = 20000  # samples per shard
 # --------------------------
 # dataclasses
 # --------------------------
-@dataclass
-class Spot:
-    cx: float
-    cy: float
-    r: float
-    area: int
-    inten: int
 
 @dataclass
 class RecorderConfig:
@@ -130,24 +124,7 @@ class SpotSignalRecorder(QObject):
 
     # ---- ROI helper (aggressive: H≈2r, W=256) ----
     def _roi_for_spot(self, cx: float, cy: float, r: float) -> tuple[int,int,int,int]:
-        h_want = max(MIN_H, int(math.ceil(2.0 * max(0.0, float(r)))))
-        h = snap_down(h_want + (STEP_H - 1), STEP_H)
-        h = max(MIN_H, min(MAX_H, h))
-
-        w = max(MIN_W, min(MAX_W, snap_down(MIN_W + (STEP_W - 1), STEP_W)))
-
-        x = int(round(cx - w/2.0))
-        y = int(round(cy - h/2.0))
-
-        x = max(OFFX_MIN, min(OFFX_MAX, x)); x = snap_down(x, OFFX_STEP)
-        y = max(OFFY_MIN, min(OFFY_MAX, y)); y = snap_down(y, OFFY_STEP)
-
-        if x + w > SENSOR_W:
-            x = snap_down(SENSOR_W - w, OFFX_STEP); x = max(OFFX_MIN, min(OFFX_MAX, x))
-        if y + h > SENSOR_H:
-            y = snap_down(SENSOR_H - h, OFFY_STEP); y = max(OFFY_MIN, min(OFFY_MAX, y))
-
-        return (w, h, x, y)
+        return roi_for_spot(cx, cy, r)
 
     def _compute_crop_and_mask(self, ax: int, ay: int, aw: int, ah: int) -> None:
         """Pre-compute crop bounds and circular mask for _on_frame (called once)."""
@@ -207,7 +184,9 @@ class SpotSignalRecorder(QObject):
         tl_ch = MOSAIC_LAYOUT[(tl_sy % 2, tl_sx % 2)]
 
         meta = {
-            "spot": {"cx": cx, "cy": cy, "r": self.spot.r, "area": self.spot.area, "inten": self.spot.inten},
+            "spot": {"cx": cx, "cy": cy, "r": self.spot.r,
+                     "label": self.spot.label, "phi_cov": self.spot.phi_cov,
+                     "std_median_r": self.spot.std_median_r},
             "layout": MOSAIC_LAYOUT_STR,
             "crop_top_left_sensor_yx": [tl_sy, tl_sx],
             "crop_top_left_channel": tl_ch,

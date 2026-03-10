@@ -11,6 +11,7 @@ from polarcam.hardware import (
     SENSOR_W, SENSOR_H, STEP_W, STEP_H, MIN_W, MIN_H, MAX_W, MAX_H,
     OFFX_MIN, OFFX_MAX, OFFY_MIN, OFFY_MAX, OFFX_STEP, OFFY_STEP,
     MOSAIC_LAYOUT, MOSAIC_LAYOUT_STR, snap_down,
+    roi_for_spot,
 )
 
 @dataclass
@@ -207,7 +208,7 @@ class MultiSpotCycler(QObject):
             cx, cy, r = s.cx, s.cy, s.r
 
             # Apply tiny HW ROI (queued to controller/camera thread)
-            w, h, x, y = self._hw_roi_request_for_spot(cx, cy, r)
+            w, h, x, y = roi_for_spot(cx, cy, r)
             try: self._req_set_roi.emit(w, h, x, y)
             except Exception as e:
                 self.error.emit(f"Failed set_roi for spot {i+1}: {e}")
@@ -336,9 +337,9 @@ class MultiSpotCycler(QObject):
 
         meta = {
             "spot": {"cx": spot.cx, "cy": spot.cy, "r": spot.r,
-                     "label": getattr(spot, 'label', ''),
-                     "phi_cov": getattr(spot, 'phi_cov', 0.0),
-                     "std_median_r": getattr(spot, 'std_median_r', float('nan'))},
+                     "label": spot.label,
+                     "phi_cov": spot.phi_cov,
+                     "std_median_r": spot.std_median_r},
             "applied_roi": {"x": int(applied_roi[0]), "y": int(applied_roi[1]),
                             "w": int(applied_roi[2]), "h": int(applied_roi[3])} if applied_roi else None,
             "crop_abs": {"x": int(crop_abs[0]), "y": int(crop_abs[1]),
@@ -380,7 +381,7 @@ class MultiSpotCycler(QObject):
 
         meta: dict = {
             "spot": {"cx": spot.cx, "cy": spot.cy, "r": spot.r,
-                     "label": getattr(spot, 'label', '')},
+                     "label": spot.label},
             "applied_roi": {"x": int(applied_roi[0]), "y": int(applied_roi[1]),
                             "w": int(applied_roi[2]), "h": int(applied_roi[3])} if applied_roi else None,
             "crop_abs": {"x": int(crop_abs[0]), "y": int(crop_abs[1]),
@@ -414,28 +415,3 @@ class MultiSpotCycler(QObject):
             f"Raw saved {fname}  ({stack.shape[0]} frames, {stack.shape[1]}\u00d7{stack.shape[2]})")
         self._raw_crops.clear()
         self._raw_t.clear()
-
-    def _hw_roi_request_for_spot(self, cx: float, cy: float, r: float) -> Tuple[int, int, int, int]:
-        """
-        Aggressive ROI:
-          - Width fixed to 256 (step 4)
-          - Height ≈ 2*r (step 2, min 2)
-          - Offsets snapped (x step 4, y step 2) and clamped to sensor box.
-        """
-        h_want = max(MIN_H, int(math.ceil(2.0 * max(0.0, float(r)))))
-        h = snap_down(h_want + (STEP_H - 1), STEP_H)
-        h = max(MIN_H, min(MAX_H, h))
-
-        w = max(MIN_W, min(MAX_W, snap_down(MIN_W + (STEP_W - 1), STEP_W)))
-
-        x = int(round(cx - w / 2.0))
-        y = int(round(cy - h / 2.0))
-        x = snap_down(max(OFFX_MIN, min(OFFX_MAX, x)), OFFX_STEP)
-        y = snap_down(max(OFFY_MIN, min(OFFY_MAX, y)), OFFY_STEP)
-
-        if x + w > SENSOR_W:
-            x = snap_down(SENSOR_W - w, OFFX_STEP); x = max(OFFX_MIN, min(OFFX_MAX, x))
-        if y + h > SENSOR_H:
-            y = snap_down(SENSOR_H - h, OFFY_STEP); y = max(OFFY_MIN, min(OFFY_MAX, y))
-
-        return (w, h, x, y)

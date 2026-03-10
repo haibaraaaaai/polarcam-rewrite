@@ -12,6 +12,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from polarcam.hardware import (
     SENSOR_W, SENSOR_H, STEP_W, STEP_H, MIN_W, MIN_H, snap_down,
+    Spot, roi_for_spot,
 )
 
 UI_CAP_MAX = 20.0  # preview cap (Hz)
@@ -20,20 +21,18 @@ SCATTER_PAUSE_S = 10.0   # seconds between refreshes
 
 # ---- Type-only imports ----
 if TYPE_CHECKING:
-    from .spot_recorder import SpotSignalRecorder, RecorderConfig, Spot  # type: ignore[misc]
+    from .spot_recorder import SpotSignalRecorder, RecorderConfig  # type: ignore[misc]
 
 # ---- Runtime-optional imports ----
 try:
     from .spot_recorder import (
         SpotSignalRecorder as SpotSignalRecorderRT,
         RecorderConfig as RecorderConfigRT,
-        Spot as SpotRT,
     )
     _RECORDER_AVAILABLE = True
 except Exception:
     SpotSignalRecorderRT = None  # type: ignore[assignment]
     RecorderConfigRT = None      # type: ignore[assignment]
-    SpotRT = None                # type: ignore[assignment]
     _RECORDER_AVAILABLE = False
 
 
@@ -377,24 +376,7 @@ class SpotViewerWindow(QMainWindow):
         if not self.spots:
             return
         s = self.spots[self.idx]
-        cx, cy, r = s.cx, s.cy, s.r
-        r_eff = max(4.0, float(r))
-        margin = 6
-
-        w = max(MIN_W, int(math.ceil(2 * r_eff + 2 * margin)))
-        w = ((w + STEP_W - 1) // STEP_W) * STEP_W
-        h = max(MIN_H, int(math.ceil(2 * r_eff + 2 * margin)))
-        h = ((h + STEP_H - 1) // STEP_H) * STEP_H
-
-        x = int(round(cx - w / 2.0))
-        y = int(round(cy - h / 2.0))
-        x = max(0, snap_down(x, STEP_W))
-        y = max(0, snap_down(y, STEP_H))
-        if x + w > SENSOR_W:
-            x = max(0, snap_down(SENSOR_W - w, STEP_W))
-        if y + h > SENSOR_H:
-            y = max(0, snap_down(SENSOR_H - h, STEP_H))
-
+        w, h, x, y = roi_for_spot(s.cx, s.cy, s.r, margin=6, min_r=4.0)
         try:
             if hasattr(self.dev, 'set_roi'):
                 self.dev.set_roi(w, h, x, y)
@@ -418,7 +400,7 @@ class SpotViewerWindow(QMainWindow):
             return
 
         s = self.spots[self.idx]
-        spot = SpotRT(s.cx, s.cy, s.r, 0, 0)  # runtime class
+        spot = s  # already a Spot instance
 
         out_dir = os.path.join(os.getcwd(), "captures")
         cfg = RecorderConfigRT(

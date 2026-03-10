@@ -13,8 +13,8 @@
 ## Code quality
 
 - [ ] **Split `main_window.py` into mixins** — at ~1300 lines it handles video, detection, recording, cycling, and spot management. Extract into focused mixins or helper classes (e.g. `_CycleMixin`, `_DetectMixin`, `_RecordMixin`) that the main window composes.
-- [ ] **Deduplicate ROI-for-spot logic** — `spot_cycler._hw_roi_request_for_spot`, `spot_recorder._roi_for_spot`, and `spot_viewer._set_spot_roi` are near-identical. Extract a shared `roi_for_spot(cx, cy, r)` into `hardware.py`.
-- [ ] **Unify `Spot` vs `DetectedSpot`** — `spot_recorder.Spot(cx, cy, r, area, inten)` and `spot_detect.DetectedSpot(cx, cy, r, label, phi_cov, std_median_r)` represent the same concept with different fields. Consider a single dataclass.
+- [x] **Deduplicate ROI-for-spot logic** — extracted `roi_for_spot(cx, cy, r, *, margin, min_r)` into `hardware.py`. Cycler and recorder use `margin=0` (aggressive), viewer uses `margin=6, min_r=4` (generous).
+- [x] **Unify `Spot` vs `DetectedSpot`** — single `Spot(cx, cy, r, label, phi_cov, std_median_r)` dataclass in `hardware.py`. `DetectedSpot` kept as alias for backward compat.
 
 ## UX / live features
 

@@ -7,24 +7,16 @@ Orchestrates:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import List, Sequence
 
 import numpy as np
 
 from polarcam.analysis.detect import find_spot_centers_dog
 from polarcam.analysis.classify import classify_spots
+from polarcam.hardware import Spot
 
-
-@dataclass
-class DetectedSpot:
-    """A detected spot with classification metadata."""
-    cx: float           # raw-frame x coordinate
-    cy: float           # raw-frame y coordinate
-    r: float            # effective radius (raw-frame pixels)
-    label: str          # "partial" / "irregular spinner" / "good spinner"
-    phi_cov: float      # φ-coverage fraction (0–1)
-    std_median_r: float # std of median(r) per occupied φ-bin
+# Backward-compat alias
+DetectedSpot = Spot
 
 
 def detect_and_classify(
@@ -44,7 +36,7 @@ def detect_and_classify(
     min_pts_per_bin: int = 2,
     coverage_threshold: float = 0.75,
     r_uniformity_threshold: float = 0.05,
-) -> List[DetectedSpot]:
+) -> List[Spot]:
     """
     Run DoG detection on the S-map, then classify each spot.
 
@@ -53,7 +45,7 @@ def detect_and_classify(
 
     Returns
     -------
-    spots : list of DetectedSpot
+    spots : list of Spot
     """
     centers = find_spot_centers_dog(
         s_map,
@@ -77,10 +69,10 @@ def detect_and_classify(
         r_uniformity_threshold=r_uniformity_threshold,
     )
 
-    spots: List[DetectedSpot] = []
+    spots: List[Spot] = []
     for (cx_s, cy_s, r_eff), cls in zip(centers, classifications):
         # S-map node → raw-frame coords (half-pixel shift from intersection grid)
-        spots.append(DetectedSpot(
+        spots.append(Spot(
             cx=cx_s + 0.5,
             cy=cy_s + 0.5,
             r=r_eff,
